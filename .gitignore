@@ -1,0 +1,6 @@
+*.db
+__pycache__/
+*.pyc
+ignored_tickers.json
+excluded_positions.json
+Data/
