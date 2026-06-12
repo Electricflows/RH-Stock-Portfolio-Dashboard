@@ -2137,7 +2137,7 @@ with tab_import:
                 st.warning(f"Could not fetch prices for: {', '.join(failed)}")
             st.cache_data.clear()
             st.session_state.pop("price_check_done", None)
-            st.info("Data refreshed. Switch to another tab to see updated portfolio.")
+            st.rerun()
 
     st.divider()
     st.subheader("Flagged Transactions")
