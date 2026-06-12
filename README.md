@@ -1,6 +1,10 @@
 # RH Stock Portfolio Dashboard
 
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://rh-stock-portfolio-dashboard.streamlit.app/)
+
 A personal portfolio tracker built with Streamlit that imports Robinhood CSV exports and gives you a full picture of your investments — performance, positions, dividends, and more.
+
+🔗 **[Try the live demo →](https://rh-stock-portfolio-dashboard.streamlit.app/)**
 
 ![Dashboard Preview](docs/screenshot.png)
 
