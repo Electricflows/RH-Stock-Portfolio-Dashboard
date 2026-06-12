@@ -379,10 +379,6 @@ def load_ticker_fundamentals(tickers_tuple):
     with ThreadPoolExecutor(max_workers=min(len(tickers_tuple), 8)) as pool:
         for t, data in pool.map(_fetch_one, tickers_tuple):
             result[t] = data
-    # If every non-delisted ticker returned an empty dict, yfinance likely failed — don't cache so next load retries
-    non_dl = [t for t in tickers_tuple if result.get(t) != {"sector": "Delisted"}]
-    if non_dl and all(not result.get(t) for t in non_dl):
-        raise RuntimeError("Fundamentals fetch returned all empty — skipping cache")
     return result
 
 @st.cache_data(ttl=300)
