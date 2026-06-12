@@ -163,8 +163,17 @@ if visible_failures:
 # Sidebar — account & date selection
 # ---------------------------------------------------------------------------
 
+IS_CLOUD = os.path.exists("/mount/src")
+
 with st.sidebar:
     st.title("📈 Portfolio")
+    if IS_CLOUD:
+        st.info(
+            "**Demo mode** — running on Streamlit Cloud. "
+            "Some live data (sector info, fundamentals) may be unavailable due to API rate limits. "
+            "Run locally for full functionality.",
+            icon="☁️",
+        )
     st.divider()
 
     account_dbs  = get_account_dbs(".")
