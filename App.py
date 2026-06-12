@@ -1065,16 +1065,19 @@ with tab_positions:
                         continue
                 return None
 
-            # Gather buy / sell events from the full transaction history for this ticker
+            # Gather buy / sell / split events from transaction history for this ticker
             _buy_types  = {"buy", "crypto_buy", "transfer_in", "dividend_reinvestment"}
             _sell_types = {"sell", "crypto_sell"}
             _tx_all = load_transactions(tuple(selected_dbs), selected_account, ticker, None)
 
-            # Shared marker lists — value chart uses close-price y, price chart uses tx-price y
-            bx, by, bt = [], [], []      # position-value chart markers
-            sx, sy, st_ = [], [], []
-            pbx, pby, pbt = [], [], []   # price chart markers (y = transaction price)
+            # price_dict: split-adjusted display prices (smooth, no plummet at split)
+            _price_dict = dict(zip(tc["dates"], tc.get("prices", [])))
+
+            bx, by, bt   = [], [], []    # position-value chart markers
+            sx, sy, st_  = [], [], []
+            pbx, pby, pbt = [], [], []   # price chart markers (snapped to display price)
             psx, psy, pst = [], [], []
+            split_dates   = []           # dates of stock splits for annotations
 
             for _, row in _tx_all.iterrows():
                 iso = _iso(row.get("Date", ""))
@@ -1086,7 +1089,7 @@ with tab_positions:
                 qty   = row.get("Qty",    "")
                 price = row.get("Price",  "")
                 amt   = row.get("Amount", "")
-                qty_s   = f"{float(qty):.4f}"   if qty   not in ("", None) else "—"
+                qty_s   = f"{float(qty):.4f}"    if qty   not in ("", None) else "—"
                 price_s = f"${float(price):.4f}" if price not in ("", None) else "—"
                 amt_s   = f"${float(amt):,.2f}"  if amt   not in ("", None) else "—"
 
@@ -1095,33 +1098,28 @@ with tab_positions:
                     yv = _date_val[cd]
                     bx.append(cd); by.append(yv)
                     bt.append(f"BUY  {iso}<br>{qty_s} shares @ {price_s}<br>Total: {amt_s}")
-                    # Price chart: y at actual transaction price
-                    try:
-                        tx_px = float(price) if price not in ("", None) else _date_val[cd] / max(float(qty), 1e-9)
-                    except Exception:
-                        tx_px = None
-                    if tx_px:
-                        pbx.append(cd); pby.append(tx_px)
+                    # Snap marker to the split-adjusted display price so it sits on the line
+                    disp_px = _price_dict.get(cd)
+                    if disp_px:
+                        pbx.append(cd); pby.append(disp_px)
                         pbt.append(f"BUY  {iso}<br>{qty_s} shares @ {price_s}<br>Total: {amt_s}")
                 elif tx_type in _sell_types:
                     yv = _date_val[cd]
                     sx.append(cd); sy.append(yv)
                     st_.append(f"SELL  {iso}<br>{qty_s} shares @ {price_s}<br>Proceeds: {amt_s}")
-                    try:
-                        tx_px = float(price) if price not in ("", None) else _date_val[cd] / max(float(qty), 1e-9)
-                    except Exception:
-                        tx_px = None
-                    if tx_px:
-                        psx.append(cd); psy.append(tx_px)
+                    disp_px = _price_dict.get(cd)
+                    if disp_px:
+                        psx.append(cd); psy.append(disp_px)
                         pst.append(f"SELL  {iso}<br>{qty_s} shares @ {price_s}<br>Proceeds: {amt_s}")
+                elif tx_type == "stock_split":
+                    split_dates.append((cd, qty_s))
 
             # ── Price chart ──────────────────────────────────────────────────
-            _price_dict = dict(zip(tc["dates"], tc.get("prices", [])))
             if tc.get("prices"):
                 fig_price = go.Figure()
                 fig_price.add_trace(go.Scatter(
                     x=tc["dates"], y=tc["prices"],
-                    name="Price",
+                    name="Price (split-adjusted)",
                     line=dict(color="#a78bfa", width=2),
                     fill="tozeroy", fillcolor="rgba(167,139,250,0.06)",
                 ))
@@ -1139,8 +1137,18 @@ with tab_positions:
                                     line=dict(color="#3a1a1a", width=1)),
                         hovertext=pst, hoverinfo="text",
                     ))
+                # Split event markers
+                for _sd, _sq in split_dates:
+                    fig_price.add_vline(
+                        x=_sd, line_color="#fbbf24", line_dash="dash", line_width=1.5, opacity=0.7,
+                    )
+                    fig_price.add_annotation(
+                        x=_sd, yref="paper", y=1.04,
+                        text=f"Split {_sq}:1", showarrow=False,
+                        font=dict(color="#fbbf24", size=10), xanchor="center",
+                    )
                 fig_price.update_layout(
-                    title=f"{ticker} — Share Price",
+                    title=f"{ticker} — Share Price (split-adjusted)",
                     height=340,
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#ccc"),
