@@ -1112,7 +1112,12 @@ with tab_positions:
                         psx.append(cd); psy.append(disp_px)
                         pst.append(f"SELL  {iso}<br>{qty_s} shares @ {price_s}<br>Proceeds: {amt_s}")
                 elif tx_type == "stock_split":
-                    split_dates.append((cd, qty_s))
+                    try:
+                        _ratio = float(qty) if qty not in ("", None) else 0
+                        _ratio_str = str(int(_ratio)) if _ratio == int(_ratio) else f"{_ratio:g}"
+                    except Exception:
+                        _ratio_str = qty_s
+                    split_dates.append((cd, _ratio_str))
 
             # ── Price chart ──────────────────────────────────────────────────
             if tc.get("prices"):

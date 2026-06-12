@@ -1067,18 +1067,19 @@ def get_ticker_daily_values(ticker: str, account_dbs: list,
         shares = sum(lot[0] for lot in fifo)
         cost   = sum(lot[0] * lot[1] for lot in fifo)
 
-        # Use transaction price on trade days; closing price on all other days.
+        # price_display: always the raw split-adjusted series price — gives a
+        # smooth continuous line on the chart regardless of whether today is a
+        # trade day or not.
+        pi_d          = bisect.bisect_right(ser_dates, ds) - 1
+        price_display = ser[ser_dates[pi_d]] if pi_d >= 0 else (ser[ser_dates[0]] if ser_dates else 0.0)
+
+        # price_: used for value calculation only.
+        # On trade days use the actual transaction price (accurate to what was
+        # paid/received). On other days use the series price × split factor so
+        # that pre-split FIFO lot counts × corrected price = true market value.
         if ds in tx_val_price:
             price_ = tx_val_price[ds]
-            price_display = price_   # tx price already at correct scale
         else:
-            pi            = bisect.bisect_right(ser_dates, ds) - 1
-            price_display = ser[ser_dates[pi]] if pi >= 0 else (ser[ser_dates[0]] if ser_dates else 0.0)
-            # price_ for value calculation uses split-factor correction so that
-            # pre-split FIFO lot counts × corrected price = true market value.
-            # price_display stays as-is (split-adjusted) for the price chart so
-            # it shows a smooth continuous line rather than a visual plummet at
-            # the split date.
             price_ = price_display
             if ticker_split_schedule:
                 price_ *= ticker_split_fac_list[date_idx]
