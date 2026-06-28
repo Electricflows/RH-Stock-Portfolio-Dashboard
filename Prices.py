@@ -31,16 +31,46 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 CRYPTO_TICKERS = {
-    "BTC", "ETH", "SOL", "XRP", "DOGE", "SHIB", "PEPE", "ADA",
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "SHIB", "ADA",
     "AVAX", "XLM", "DOT", "MATIC", "LTC", "BCH", "LINK", "UNI",
     "ATOM", "ETC", "TRX", "APT", "OP", "ARB",
 }
 
-def to_yf_ticker(ticker: str) -> str:
-    """Return the Yahoo Finance symbol for a ticker."""
-    if ticker.upper() in CRYPTO_TICKERS:
-        return f"{ticker.upper()}-USD"
-    return ticker.upper()
+# Crypto tickers whose Yahoo Finance symbol differs from {TICKER}-USD
+CRYPTO_SYMBOL_OVERRIDES = {
+    "PEPE": "PEPE24478-USD",
+}
+
+def get_ticker_aliases(prices_db: str = "prices.db") -> dict:
+    """Return {old_ticker: new_ticker} from the ticker_aliases table."""
+    if not Path(prices_db).exists():
+        return {}
+    try:
+        conn = sqlite3.connect(prices_db)
+        rows = conn.execute("SELECT old_ticker, new_ticker FROM ticker_aliases").fetchall()
+        conn.close()
+        return {r[0].upper(): r[1].upper() for r in rows}
+    except Exception:
+        return {}
+
+
+def to_yf_ticker(ticker: str, aliases: dict = None) -> str:
+    """Return the Yahoo Finance symbol for a ticker, applying aliases and crypto mapping."""
+    t = ticker.upper().lstrip("$")
+    # Strip existing -USD suffix to normalise the base symbol
+    base = t[:-4] if t.endswith("-USD") else t
+    # User-defined alias takes priority
+    if aliases and base in aliases:
+        return aliases[base]
+    if aliases and t in aliases:
+        return aliases[t]
+    # Crypto override map (non-standard Yahoo symbols)
+    if base in CRYPTO_SYMBOL_OVERRIDES:
+        return CRYPTO_SYMBOL_OVERRIDES[base]
+    # Standard crypto mapping
+    if base in CRYPTO_TICKERS:
+        return f"{base}-USD"
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +97,13 @@ CREATE TABLE IF NOT EXISTS ticker_info (
     last_fetched TEXT,
     updated_at   TEXT,
     long_name    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ticker_aliases (
+    old_ticker  TEXT PRIMARY KEY,
+    new_ticker  TEXT NOT NULL,
+    notes       TEXT,
+    added_at    TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS delisted_tickers (
@@ -132,6 +169,32 @@ def unmark_ticker_delisted(ticker: str, prices_db: str = "prices.db"):
         return
     conn = sqlite3.connect(prices_db)
     conn.execute("DELETE FROM delisted_tickers WHERE ticker = ?", (ticker.upper(),))
+    conn.commit()
+    conn.close()
+
+
+def add_ticker_alias(old_ticker: str, new_ticker: str,
+                     notes: str = "", prices_db: str = "prices.db"):
+    """Map old_ticker → new_ticker for price fetching (e.g. ticker renames)."""
+    conn = init_prices_db(prices_db)
+    conn.execute(
+        """INSERT INTO ticker_aliases (old_ticker, new_ticker, notes)
+           VALUES (?, ?, ?)
+           ON CONFLICT(old_ticker) DO UPDATE SET
+             new_ticker = excluded.new_ticker,
+             notes      = excluded.notes""",
+        (old_ticker.upper(), new_ticker.upper(), notes),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_ticker_alias(old_ticker: str, prices_db: str = "prices.db"):
+    """Remove a ticker alias."""
+    if not Path(prices_db).exists():
+        return
+    conn = sqlite3.connect(prices_db)
+    conn.execute("DELETE FROM ticker_aliases WHERE old_ticker = ?", (old_ticker.upper(),))
     conn.commit()
     conn.close()
 
@@ -244,9 +307,10 @@ def upsert_prices(conn: sqlite3.Connection, ticker: str, df: pd.DataFrame):
 
 def update_prices(prices_conn: sqlite3.Connection, tickers: dict[str, date]):
     today = date.today()
+    aliases = get_ticker_aliases()
 
     for ticker, earliest_tx_date in sorted(tickers.items()):
-        yf_ticker = to_yf_ticker(ticker)
+        yf_ticker = to_yf_ticker(ticker, aliases)
 
         # Determine fetch window(s)
         row = prices_conn.execute(
@@ -339,9 +403,10 @@ def fetch_ticker_names(tickers: list, prices_db: str = "prices.db") -> dict:
     cached = {r[0]: r[1] for r in rows if r[1]}
 
     missing = [t for t in tickers if t not in cached]
+    _aliases = get_ticker_aliases()
 
     for ticker in missing:
-        yf_sym = to_yf_ticker(ticker)
+        yf_sym = to_yf_ticker(ticker, _aliases)
         try:
             info = yf.Ticker(yf_sym).info
             name = info.get("longName") or info.get("shortName") or ticker
@@ -385,6 +450,7 @@ def check_and_fill_price_gaps(
     prices_conn = init_prices_db(prices_db)
     failed: list[str] = []
     today = date.today()
+    aliases = get_ticker_aliases(prices_db)
 
     # Skip tickers the user has explicitly marked as delisted
     try:
@@ -396,9 +462,10 @@ def check_and_fill_price_gaps(
         _delisted_set = set()
 
     for ticker, earliest_tx_date in sorted(tickers.items()):
-        if ticker.upper() in _delisted_set:
+        _ticker_clean = ticker.upper().lstrip("$")
+        if ticker.upper() in _delisted_set or _ticker_clean in _delisted_set:
             continue
-        yf_ticker = to_yf_ticker(ticker)
+        yf_ticker = to_yf_ticker(ticker, aliases)
 
         row = prices_conn.execute(
             "SELECT MIN(date), MAX(date) FROM prices WHERE ticker = ?", (ticker,)

@@ -30,12 +30,18 @@ from Calculations import (
     get_52week_ranges,
     get_ticker_names,
     get_transactions_df,
+    BUY_TYPES,
+    SELL_TYPES,
+    TRANSFER_IN_TYPES,
 )
 from Prices import (
     check_and_fill_price_gaps,
     get_delisted_tickers,
     mark_ticker_delisted,
     unmark_ticker_delisted,
+    get_ticker_aliases,
+    add_ticker_alias,
+    remove_ticker_alias,
     to_yf_ticker,
 )
 from Import import init_db, import_csv, account_to_db_name, ensure_indexes
@@ -61,10 +67,38 @@ def load_excluded_positions() -> set:
 
 def save_excluded_positions(tickers: set):
     EXCLUDED_POSITIONS_FILE.write_text(json.dumps(sorted(tickers)))
-    return set()
 
 def save_ignored_tickers(tickers: set):
     IGNORED_TICKERS_FILE.write_text(json.dumps(sorted(tickers)))
+
+SETTINGS_FILE = Path("settings.json")
+
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            return json.loads(SETTINGS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_settings(d: dict):
+    existing = load_settings()
+    existing.update(d)
+    SETTINGS_FILE.write_text(json.dumps(existing, indent=2))
+
+WATCHLIST_FILE = Path("watchlist.json")
+
+def load_watchlist() -> list:
+    """Return list of {ticker, note, added} dicts."""
+    if WATCHLIST_FILE.exists():
+        try:
+            return json.loads(WATCHLIST_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+def save_watchlist(items: list):
+    WATCHLIST_FILE.write_text(json.dumps(items, indent=2))
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -84,6 +118,8 @@ st.markdown("""
         border-radius: 10px;
         padding: 16px 20px;
         margin-bottom: 8px;
+        height: 100%;
+        box-sizing: border-box;
     }
     .metric-label { font-size: 0.78rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
     .metric-value { font-size: 1.6rem; font-weight: 700; margin-top: 4px; }
@@ -118,6 +154,25 @@ st.markdown("""
     .wk52-dot   { position: absolute; top: -3px; width: 12px; height: 12px;
                   border-radius: 50%; transform: translateX(-50%); }
     .pos-price  { font-size: 1.05rem; color: #94a3b8; font-weight: 600; }
+
+    /* Equal-height cards per row */
+    div[data-testid="stHorizontalBlock"] { align-items: stretch; }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]
+        > div > div > div[data-testid="stMarkdownContainer"] { height: 100%; }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]
+        > div > div > div[data-testid="stMarkdownContainer"] > div.metric-card { height: 100%; }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        display: flex; flex-direction: column;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]
+        > div[data-testid="stVerticalBlockBorderWrapper"],
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]
+        > div[data-testid="stVerticalBlockBorderWrapper"] > div[data-testid="stVerticalBlock"] {
+        flex: 1; display: flex; flex-direction: column;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] .pos-card {
+        flex: 1;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -164,6 +219,7 @@ if visible_failures:
 # ---------------------------------------------------------------------------
 
 IS_CLOUD = os.path.exists("/mount/src")
+_settings = load_settings()
 
 with st.sidebar:
     st.title("📈 Portfolio")
@@ -250,19 +306,45 @@ with st.sidebar:
     st.caption(f"📅 Active range: {_range_label}")
 
     st.divider()
-    st.subheader("Concentration Alerts")
-    _stock_thresh = st.slider(
-        "Per-stock threshold (%)",
-        min_value=5, max_value=50, value=20, step=5,
-        help="Warn when a single position exceeds this % of total portfolio value.",
-        key="conc_stock_thresh",
+    _conc_enabled = st.checkbox(
+        "Concentration Alerts",
+        value=_settings.get("conc_enabled", True),
+        key="conc_enabled_chk",
+        help="Show warnings when a single stock or sector exceeds the thresholds below.",
     )
-    _sector_thresh = st.slider(
-        "Per-sector threshold (%)",
-        min_value=10, max_value=80, value=40, step=5,
-        help="Warn when a single sector exceeds this % of total portfolio value.",
-        key="conc_sector_thresh",
+    if _conc_enabled != _settings.get("conc_enabled", True):
+        save_settings({"conc_enabled": _conc_enabled})
+    if _conc_enabled:
+        _stock_thresh = st.slider(
+            "Per-stock threshold (%)",
+            min_value=5, max_value=50,
+            value=_settings.get("conc_stock_thresh", 20), step=5,
+            help="Warn when a single position exceeds this % of total portfolio value.",
+            key="conc_stock_thresh",
+        )
+        _sector_thresh = st.slider(
+            "Per-sector threshold (%)",
+            min_value=10, max_value=80,
+            value=_settings.get("conc_sector_thresh", 40), step=5,
+            help="Warn when a single sector exceeds this % of total portfolio value.",
+            key="conc_sector_thresh",
+        )
+        if (_stock_thresh != _settings.get("conc_stock_thresh", 20) or
+                _sector_thresh != _settings.get("conc_sector_thresh", 40)):
+            save_settings({"conc_stock_thresh": _stock_thresh, "conc_sector_thresh": _sector_thresh})
+    else:
+        _stock_thresh  = _settings.get("conc_stock_thresh", 20)
+        _sector_thresh = _settings.get("conc_sector_thresh", 40)
+
+    st.divider()
+    st.subheader("Custom Benchmarks")
+    _custom_bm_raw = st.text_input(
+        "Extra tickers (comma-separated)",
+        key="custom_benchmarks",
+        placeholder="e.g. QQQ, ARKK, BRK-B",
+        help="Any Yahoo Finance ticker. Will appear in the benchmark overlay selector on Performance and detail charts.",
     )
+    _custom_bm_tickers = [t.strip().upper() for t in _custom_bm_raw.split(",") if t.strip()]
 
     st.divider()
     if st.button("🔄  Refresh Data", width='stretch'):
@@ -277,9 +359,10 @@ def load_summary(dbs_tuple, account):
     return get_portfolio_summary(list(dbs_tuple), account=account)
 
 @st.cache_data(ttl=300)
-def load_daily(dbs_tuple, account, start, end):
+def load_daily(dbs_tuple, account, start, end, excluded_tuple=()):
     return get_daily_values(list(dbs_tuple), start_date=start,
-                            end_date=end, account=account)
+                            end_date=end, account=account,
+                            exclude_tickers=set(excluded_tuple))
 
 @st.cache_data(ttl=300)
 def load_transactions(dbs_tuple, account, ticker_filter, type_filter):
@@ -301,16 +384,32 @@ def load_ticker_daily(dbs_tuple, account, ticker, start, end):
                                    start_date=start, end_date=end,
                                    account=account)
 
-BENCHMARKS = {
-    "S&P 500":  "^GSPC",
+_BUILTIN_BENCHMARKS = {
+    "S&P 500":   "^GSPC",
     "Dow Jones": "^DJI",
-    "Nasdaq":   "^IXIC",
+    "Nasdaq":    "^IXIC",
+    "Russell 2000": "^RUT",
+    "Total Market (VTI)": "VTI",
+    "60/40 (AOR)": "AOR",
 }
-BENCHMARK_COLORS = {
-    "S&P 500":  "#f97316",
-    "Dow Jones": "#38bdf8",
-    "Nasdaq":   "#e879f9",
+_BUILTIN_BENCHMARK_COLORS = {
+    "S&P 500":            "#f97316",
+    "Dow Jones":          "#38bdf8",
+    "Nasdaq":             "#e879f9",
+    "Russell 2000":       "#34d399",
+    "Total Market (VTI)": "#a78bfa",
+    "60/40 (AOR)":        "#fb923c",
 }
+_CUSTOM_BM_COLORS = ["#f43f5e", "#22d3ee", "#84cc16", "#eab308", "#c084fc"]
+
+# Will be extended at runtime with any custom tickers the user adds
+BENCHMARKS: dict        = dict(_BUILTIN_BENCHMARKS)
+BENCHMARK_COLORS: dict  = dict(_BUILTIN_BENCHMARK_COLORS)
+
+for _i, _ct in enumerate(_custom_bm_tickers):
+    if _ct not in BENCHMARKS:
+        BENCHMARKS[_ct] = _ct
+        BENCHMARK_COLORS[_ct] = _CUSTOM_BM_COLORS[_i % len(_CUSTOM_BM_COLORS)]
 
 @st.cache_data(ttl=1800)
 def load_benchmark_history(start: str, end: str, benchmarks_tuple: tuple = ()) -> dict:
@@ -322,9 +421,8 @@ def load_benchmark_history(start: str, end: str, benchmarks_tuple: tuple = ()) -
     names_to_fetch = benchmarks_tuple if benchmarks_tuple else tuple(BENCHMARKS.keys())
     result = {}
     for name in names_to_fetch:
-        sym = BENCHMARKS.get(name)
-        if not sym:
-            continue
+        # Custom tickers use the name as the symbol directly
+        sym = BENCHMARKS.get(name, name)
         try:
             df = _yf.Ticker(sym).history(start=start, end=end, auto_adjust=True)
             if df is not None and not df.empty:
@@ -338,6 +436,7 @@ def load_benchmark_history(start: str, end: str, benchmarks_tuple: tuple = ()) -
     return result
 
 @st.cache_data(ttl=1800)
+
 def load_ticker_fundamentals(tickers_tuple):
     """Fetch P/E, forward P/E, market cap, and analyst price targets from Yahoo Finance."""
     import yfinance as _yf
@@ -380,6 +479,20 @@ def load_ticker_fundamentals(tickers_tuple):
                 "free_cashflow":   info.get("freeCashflow"),
                 "oper_cashflow":   info.get("operatingCashflow"),
                 "total_assets":    total_assets,
+                "gross_margins":     info.get("grossMargins"),
+                "oper_margins":      info.get("operatingMargins"),
+                "revenue_growth":    info.get("revenueGrowth"),
+                "earnings_growth":   info.get("earningsGrowth"),
+                "debt_to_equity":    info.get("debtToEquity"),
+                "shares_outstanding":info.get("sharesOutstanding"),
+                # Next earnings: pick first FUTURE timestamp across all fields
+                "earnings_ts":       next((ts for ts in [
+                                          info.get("earningsTimestamp"),
+                                          info.get("earningsTimestampStart"),
+                                          info.get("earningsTimestampEnd"),
+                                      ] if ts and ts > __import__("time").time()), None),
+                # EQUITY | ETF | MUTUALFUND | INDEX | CRYPTOCURRENCY …
+                "quote_type":        (info.get("quoteType") or "EQUITY").upper(),
             }
         except Exception:
             return t, {}
@@ -389,6 +502,95 @@ def load_ticker_fundamentals(tickers_tuple):
         for t, data in pool.map(_fetch_one, tickers_tuple):
             result[t] = data
     return result
+
+@st.cache_data(ttl=3600)
+def load_ticker_extended(ticker: str) -> dict:
+    """
+    Fetch annual income/cashflow history and next earnings date for one ticker.
+    Heavier than fundamentals — only called in detail view and Compare tab.
+    Returns {"earnings_date": date|None, "annual": {year_str: {revenue, gross_profit,
+             net_income, fcf, ocf, shares, shares_diluted}}}
+    """
+    import yfinance as _yf
+    _empty = {"earnings_date": None, "annual": {}}
+    try:
+        obj = _yf.Ticker(to_yf_ticker(ticker))
+
+        # Next earnings date — calendar dict first, then info timestamp fallback
+        earnings_date = None
+        try:
+            cal = obj.calendar
+            if isinstance(cal, dict):
+                ed_list = cal.get("Earnings Date", [])
+                if hasattr(ed_list, "__iter__") and not isinstance(ed_list, str):
+                    future = []
+                    for d in ed_list:
+                        try:
+                            d_obj = d.date() if hasattr(d, "date") else d
+                            if d_obj >= date.today():
+                                future.append(d_obj)
+                        except Exception:
+                            pass
+                    if future:
+                        earnings_date = min(future)
+        except Exception:
+            pass
+
+        if earnings_date is None:
+            try:
+                info = obj.info
+                for ts_key in ("earningsTimestamp", "earningsTimestampStart"):
+                    ts = info.get(ts_key)
+                    if ts:
+                        d_obj = datetime.fromtimestamp(ts).date()
+                        if d_obj >= date.today():
+                            earnings_date = d_obj
+                            break
+            except Exception:
+                pass
+
+        # Annual financial history
+        annual: dict = {}
+        try:
+            income   = obj.income_stmt
+            cashflow = obj.cashflow
+
+            if income is not None and not income.empty:
+                _income_map = {
+                    "Total Revenue":          "revenue",
+                    "Gross Profit":           "gross_profit",
+                    "Net Income":             "net_income",
+                    "Basic Average Shares":   "shares",
+                    "Diluted Average Shares": "shares_diluted",
+                }
+                _cf_map = {
+                    "Free Cash Flow":      "fcf",
+                    "Operating Cash Flow": "ocf",
+                }
+                for col in sorted(income.columns, reverse=True):
+                    try:
+                        yr = col.year if hasattr(col, "year") else int(str(col)[:4])
+                    except Exception:
+                        continue
+                    row: dict = {}
+                    for src, dst in _income_map.items():
+                        if src in income.index:
+                            v = income.loc[src, col]
+                            row[dst] = float(v) if pd.notna(v) else None
+                    if cashflow is not None and not cashflow.empty and col in cashflow.columns:
+                        for src, dst in _cf_map.items():
+                            if src in cashflow.index:
+                                v = cashflow.loc[src, col]
+                                row[dst] = float(v) if pd.notna(v) else None
+                    if row:
+                        annual[str(yr)] = row
+        except Exception:
+            pass
+
+        return {"earnings_date": earnings_date, "annual": annual}
+    except Exception:
+        return _empty
+
 
 @st.cache_data(ttl=300)
 def load_all_ticker_twrs(dbs_tuple, tickers_tuple, account, start=None, end=None):
@@ -414,9 +616,10 @@ def load_all_ticker_twrs(dbs_tuple, tickers_tuple, account, start=None, end=None
     return results
 
 summary  = load_summary(tuple(selected_dbs), selected_account)
-chart    = load_daily(tuple(selected_dbs), selected_account,
-                      start_date, today.isoformat())
 excluded = load_excluded_positions()
+chart    = load_daily(tuple(selected_dbs), selected_account,
+                      start_date, today.isoformat(),
+                      excluded_tuple=tuple(sorted(excluded)))
 
 # Adjust summary metrics to exclude hidden positions
 def _apply_exclusions(s: dict, excl: set) -> dict:
@@ -441,6 +644,8 @@ def _apply_exclusions(s: dict, excl: set) -> dict:
     adj["return_pct"] = (adj["total_gain"] / td * 100) if td > 0 else None
     return adj
 
+# Keep full positions list (including excluded) for the Positions tab display
+all_open_positions = summary["open_positions"]
 summary = _apply_exclusions(summary, excluded)
 
 # ---------------------------------------------------------------------------
@@ -459,6 +664,23 @@ def _fmt_pct(v, signed=False):
     prefix = "+" if (signed and v > 0) else ""
     return f"{prefix}{v:.2f}%"
 
+def _fmt_pct_raw(v):
+    """Format a 0–1 ratio as a percentage string, e.g. 0.153 → '15.3%'."""
+    return f"{v*100:.1f}%" if v is not None else "—"
+
+def _fmt_pct_raw_signed(v):
+    return f"{v*100:+.1f}%" if v is not None else "—"
+
+def _fmt_x(v):
+    """Format a multiple, e.g. 23.4 → '23.4x'."""
+    return f"{v:.1f}x" if v is not None else "—"
+
+def _fmt_shares(v):
+    if v is None: return "—"
+    if v >= 1e9: return f"{v/1e9:.2f}B"
+    if v >= 1e6: return f"{v/1e6:.1f}M"
+    return f"{v:,.0f}"
+
 def _color_class(v):
     if v is None or v == 0:
         return "neutral"
@@ -471,12 +693,481 @@ def _fmt_large(v) -> str:
     if v >= 1e6:  return f"${v/1e6:.2f}M"
     return f"${v:,.0f}"
 
-def metric_card(label, value, sub=None, sub_color=None):
+def _is_equity(funds: dict) -> bool:
+    """True for individual stocks; False for ETFs, mutual funds, indices, crypto."""
+    return funds.get("quote_type", "EQUITY") == "EQUITY"
+
+
+def _fmt_earnings_date(funds: dict) -> str:
+    """Return human-readable next earnings date string, or empty string."""
+    ts = funds.get("earnings_ts")
+    if not ts:
+        return ""
+    try:
+        d = datetime.fromtimestamp(ts).date()
+        if d >= date.today():
+            days_out = (d - date.today()).days
+            suffix = f" · {days_out}d" if days_out <= 90 else ""
+            return d.strftime("%b %d, %Y") + suffix
+    except Exception:
+        pass
+    return ""
+
+
+def _calc_roic(funds: dict):
+    """Return ROIC as a float (e.g. 0.15 = 15%) or None if data is missing."""
+    ocf    = funds.get("oper_cashflow")
+    assets = funds.get("total_assets")
+    cash   = funds.get("total_cash")
+    if ocf is None or assets is None or cash is None:
+        return None
+    invested = assets - cash
+    if invested <= 0:
+        return None
+    return ocf / invested
+
+
+_QS_CHECKS = [
+    # (label, weight)
+    ("Gross Margin ≥ 30%",      12.5),
+    ("Oper. Margin ≥ 10%",      12.5),
+    ("FCF Margin ≥ 8%",         12.5),
+    ("ROIC ≥ 10%",              12.5),
+    ("Net Cash Positive",       12.5),
+    ("Revenue Growth ≥ 5%",     12.5),
+    ("Earnings Growth ≥ 5%",    12.5),
+    ("Debt / Assets < 40%",     12.5),
+]
+
+def _calc_quality_score(funds: dict):
+    """
+    Returns (score: int 0–100, details: list of (label, passed, actual_str),
+             growth_phase: bool).
+    Returns (None, [], False) when fewer than 4 checks have data.
+    growth_phase = True when the company shows strong revenue growth (≥20%) but
+    fails FCF / earnings checks — signals a deliberate reinvestment phase, not
+    a fundamentally weak business.
+    """
+    ocf   = funds.get("oper_cashflow")
+    fcf   = funds.get("free_cashflow")
+    rev   = funds.get("total_revenue")
+    cash  = funds.get("total_cash")
+    debt  = funds.get("total_debt")
+    assets= funds.get("total_assets")
+    gm    = funds.get("gross_margins")
+    om    = funds.get("oper_margins")
+    rg    = funds.get("revenue_growth")
+    eg    = funds.get("earnings_growth")
+
+    roic  = _calc_roic(funds)
+
+    def _check(val, condition):
+        return condition(val) if val is not None else None
+
+    fcf_margin = (fcf / rev) if (fcf is not None and rev and rev > 0) else None
+    debt_ratio = (debt / assets) if (debt is not None and assets and assets > 0) else None
+
+    raw = [
+        _check(gm,        lambda v: v >= 0.30),
+        _check(om,        lambda v: v >= 0.10),
+        _check(fcf_margin,lambda v: v >= 0.08),
+        _check(roic,      lambda v: v >= 0.10),
+        ((cash - debt) > 0) if (cash is not None and debt is not None) else None,
+        _check(rg,        lambda v: v >= 0.05),
+        _check(eg,        lambda v: v >= 0.05),
+        _check(debt_ratio,lambda v: v < 0.40),
+    ]
+
+    def _pf(v, mult=100, suffix="%", decimals=1):
+        return f"{v * mult:.{decimals}f}{suffix}" if v is not None else None
+
+    actuals = [
+        _pf(gm),
+        _pf(om),
+        _pf(fcf_margin),
+        _pf(roic),
+        (f"${(cash-debt)/1e9:.2f}B net cash" if (cash is not None and debt is not None) else None),
+        _pf(rg),
+        _pf(eg),
+        _pf(debt_ratio),
+    ]
+
+    available = [r for r in raw if r is not None]
+    if len(available) < 4:
+        return None, [], False
+
+    score = round(sum(12.5 for r in raw if r is True))
+    details = [(label, raw[i], actuals[i]) for i, (label, _) in enumerate(_QS_CHECKS)]
+
+    # Growth-phase flag: strong revenue growth but FCF or earnings checks fail
+    _high_growth  = rg is not None and rg >= 0.20
+    _fcf_fail     = fcf_margin is not None and fcf_margin < 0.08
+    _earn_fail    = eg is not None and eg < 0.05
+    growth_phase  = _high_growth and (_fcf_fail or _earn_fail)
+
+    return score, details, growth_phase
+
+
+def _quality_color(score):
+    if score is None:
+        return "#888"
+    if score >= 75:
+        return "#4ade80"
+    if score >= 50:
+        return "#fbbf24"
+    return "#f87171"
+
+
+def _dcf_intrinsic(fcf_ps: float, growth: float, discount: float,
+                   terminal_growth: float, years: int = 10) -> float | None:
+    """Return intrinsic value per share via DCF. Returns None if inputs are invalid."""
+    if fcf_ps <= 0 or discount <= terminal_growth:
+        return None
+    pv_sum = 0.0
+    fcf = fcf_ps
+    for y in range(1, years + 1):
+        fcf *= (1 + growth)
+        pv_sum += fcf / (1 + discount) ** y
+    terminal_value = fcf * (1 + terminal_growth) / (discount - terminal_growth)
+    pv_sum += terminal_value / (1 + discount) ** years
+    return pv_sum
+
+
+def _render_dcf(ticker: str, current_price: float | None, funds: dict, key_prefix: str = ""):
+    """
+    Render an interactive DCF widget. Sliders are per-scenario; shared inputs sit above.
+    key_prefix must be unique per call site to avoid Streamlit key collisions.
+    """
+    fcf   = funds.get("free_cashflow")
+    shares= funds.get("shares_outstanding")
+
+    if not shares or shares == 0:
+        st.info("DCF requires Shares Outstanding data — not available for this ticker.")
+        return
+
+    fcf_ps_actual = (fcf / shares) if fcf else None
+
+    # ── FCF override ─────────────────────────────────────────────────────────
+    _ov_col, _ov_tog = st.columns([3, 1])
+    with _ov_tog:
+        use_override = st.checkbox("Override FCF/share", key=f"{key_prefix}_fcf_ov",
+                                   help="Use a custom normalized FCF/share instead of today's reported figure. "
+                                        "Useful for growth companies where current FCF is temporarily depressed.")
+    with _ov_col:
+        if fcf_ps_actual is not None:
+            _caption = f"Reported FCF/share: **${fcf_ps_actual:.2f}**  ·  Shares: **{shares/1e9:.3f}B**  ·  Total FCF: **${fcf/1e9:.2f}B**"
+            if fcf_ps_actual <= 0:
+                _caption += "  ·  ⚠️ Negative — override recommended"
+            st.caption(_caption)
+        else:
+            st.caption("FCF data not available — enter an override value to run the model.")
+
+    if use_override:
+        _suggested = max(fcf_ps_actual, 0.01) if fcf_ps_actual and fcf_ps_actual > 0 else 1.0
+        fcf_ps = st.number_input(
+            "Normalized FCF/share ($)", min_value=0.01, max_value=9999.0,
+            value=round(float(_suggested), 2), step=0.25,
+            key=f"{key_prefix}_fcf_ov_val",
+            help="Enter the FCF/share you expect once the business normalizes. "
+                 "A starting point: (expected revenue × target FCF margin) ÷ shares outstanding.")
+        st.caption(f"Using override FCF/share: **${fcf_ps:.2f}**  ·  implied total FCF: **${fcf_ps * shares / 1e9:.2f}B**")
+    else:
+        if fcf_ps_actual is None or fcf_ps_actual <= 0:
+            st.warning("FCF/share is negative or unavailable — check **Override FCF/share** above to enter a normalized estimate.")
+            return
+        fcf_ps = fcf_ps_actual
+
+    # ── Shared parameters ────────────────────────────────────────────────────
+    sh1, sh2, sh3 = st.columns(3)
+    with sh1:
+        dcf_years = st.slider("Projection years", 5, 15, 10, 1, key=f"{key_prefix}_yrs",
+                              help="How many years of cash flow to project before calculating a terminal value. 10 years is the standard.")
+    with sh2:
+        dcf_tg = st.slider("Terminal growth rate (%)", 1.0, 5.0, 3.0, 0.5,
+                           key=f"{key_prefix}_tg",
+                           help="The perpetual growth rate assumed after the projection period ends. Typically set near long-run GDP growth (~3%). Must be below the discount rate.") / 100
+    with sh3:
+        dcf_mos = st.slider("Margin of safety (%)", 0, 40, 25, 5,
+                            key=f"{key_prefix}_mos",
+                            help="A discount applied on top of the intrinsic value before buying. A 25% MOS means you only buy if the stock is at least 25% below the estimated fair value — protection against model error.")
+
+    st.divider()
+
+    # ── Three scenario columns ────────────────────────────────────────────────
+    _scenarios = [
+        ("🐻 Bear",  5.0,  12.0, "#f87171"),
+        ("📊 Base",  10.0, 10.0, "#fbbf24"),
+        ("🐂 Bull",  15.0,  8.0, "#4ade80"),
+    ]
+
+    sc_cols = st.columns(3)
+    for col, (label, def_g, def_d, color) in zip(sc_cols, _scenarios):
+        slug = label.split()[-1].lower()
+        with col:
+            st.markdown(f"<div style='font-size:1rem;font-weight:700;color:{color}'>{label}</div>",
+                        unsafe_allow_html=True)
+            growth   = st.slider("Growth rate (%)", 1.0, 100.0, def_g, 0.5,
+                                 key=f"{key_prefix}_{slug}_g",
+                                 help="Annual rate at which FCF is assumed to grow over the projection period. Bull = optimistic; Bear = pessimistic.") / 100
+            discount = st.slider("Discount rate (%)", 5.0, 20.0, def_d, 0.5,
+                                 key=f"{key_prefix}_{slug}_d",
+                                 help="Your required annual rate of return — used to discount future cash flows back to today's dollars. Higher = more conservative valuation. Often set to 8–12%.") / 100
+
+            iv = _dcf_intrinsic(fcf_ps, growth, discount, dcf_tg, dcf_years)
+            if iv is None:
+                st.markdown("**Intrinsic Value:** —")
+                continue
+
+            iv_mos = iv * (1 - dcf_mos / 100)   # price target after margin of safety
+
+            if current_price:
+                upside     = (iv - current_price) / current_price * 100
+                upside_mos = (iv_mos - current_price) / current_price * 100
+                upside_color = "#4ade80" if upside > 0 else "#f87171"
+                verdict = ("✅ **BUY**" if upside_mos > 0
+                           else "⚠️ **HOLD**" if upside > 0
+                           else "❌ **OVERVALUED**")
+                price_html = (
+                    f"<div style='margin-top:10px'>"
+                    f"<div style='font-size:0.72rem;color:#888'>Intrinsic Value</div>"
+                    f"<div style='font-size:1.4rem;font-weight:800;color:{color}'>${iv:.2f}</div>"
+                    f"<div style='font-size:0.72rem;color:#888;margin-top:6px'>After {dcf_mos}% MOS</div>"
+                    f"<div style='font-size:1.1rem;font-weight:700;color:{color}'>${iv_mos:.2f}</div>"
+                    f"<div style='margin-top:8px;font-size:0.85rem;color:{upside_color}'>"
+                    f"{'▲' if upside>=0 else '▼'} {upside:+.1f}% vs current ${current_price:.2f}</div>"
+                    f"<div style='margin-top:6px'>{verdict}</div>"
+                    f"</div>"
+                )
+            else:
+                price_html = (
+                    f"<div style='margin-top:10px'>"
+                    f"<div style='font-size:0.72rem;color:#888'>Intrinsic Value</div>"
+                    f"<div style='font-size:1.4rem;font-weight:800;color:{color}'>${iv:.2f}</div>"
+                    f"<div style='font-size:0.72rem;color:#888;margin-top:6px'>After {dcf_mos}% MOS</div>"
+                    f"<div style='font-size:1.1rem;font-weight:700;color:{color}'>${iv_mos:.2f}</div>"
+                    f"</div>"
+                )
+            st.markdown(price_html, unsafe_allow_html=True)
+
+    st.caption(
+        "**How to read:** Intrinsic Value = estimated fair price per share based on projected FCF. "
+        "Margin of Safety (MOS) = the discount you demand before buying — protects against model error. "
+        "Bear/Base/Bull differ by assumed growth and required return rates. "
+        "⚠️ DCF is sensitive to assumptions — treat as a range, not a precise target."
+    )
+
+
+def _ind_ma(prices: pd.Series, period: int) -> pd.Series:
+    return prices.rolling(period).mean()
+
+def _ind_bbands(prices: pd.Series, period: int = 20, n_std: float = 2.0):
+    ma  = prices.rolling(period).mean()
+    std = prices.rolling(period).std()
+    return ma + n_std * std, ma, ma - n_std * std   # upper, mid, lower
+
+def _ind_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    delta = prices.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+def _ind_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast   = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow   = prices.ewm(span=slow, adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line= macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def _render_indicators(dates: list, prices: list, selected: list, key_prefix: str = ""):
+    """
+    Render MA / Bollinger / RSI / MACD charts.
+    Period inputs are shown inline when RSI or MACD is selected.
+    Returns overlay traces (MA, BB) to add to the caller's price figure.
+    """
+    if not prices or not dates:
+        return []
+
+    px_series = pd.Series(prices, index=pd.to_datetime(dates))
+    overlay_traces = []
+
+    # ── Period controls for RSI / MACD (shown only when selected) ────────────
+    rsi_period, macd_fast, macd_slow, macd_sig = 14, 12, 26, 9
+    show_rsi  = "RSI" in selected
+    show_macd = "MACD" in selected
+
+    if show_rsi or show_macd:
+        _pcols = st.columns(5)
+        if show_rsi:
+            with _pcols[0]:
+                rsi_period = st.number_input(
+                    "RSI period", min_value=2, max_value=50, value=14, step=1,
+                    key=f"{key_prefix}_rsi_p",
+                    help="Lookback window. 14 = standard. Lower = more sensitive/noisy; higher = smoother/slower.")
+        if show_macd:
+            with _pcols[1]:
+                macd_fast = st.number_input(
+                    "MACD fast EMA", min_value=2, max_value=50, value=12, step=1,
+                    key=f"{key_prefix}_macd_f",
+                    help="Fast EMA period. Standard = 12.")
+            with _pcols[2]:
+                macd_slow = st.number_input(
+                    "MACD slow EMA", min_value=5, max_value=100, value=26, step=1,
+                    key=f"{key_prefix}_macd_s",
+                    help="Slow EMA period. Standard = 26. Must be > fast EMA.")
+            with _pcols[3]:
+                macd_sig = st.number_input(
+                    "Signal line", min_value=2, max_value=50, value=9, step=1,
+                    key=f"{key_prefix}_macd_sig",
+                    help="EMA of the MACD line used as a signal. Standard = 9.")
+
+    # ── Moving averages & Bollinger Bands (overlays) ──────────────────────────
+    ma_colors = {"MA(20)": "#fbbf24", "MA(50)": "#60a5fa", "MA(200)": "#a78bfa"}
+    for label, color in ma_colors.items():
+        if label in selected:
+            ma = _ind_ma(px_series, int(label[3:-1]))
+            overlay_traces.append(go.Scatter(
+                x=dates, y=ma.values, name=label,
+                line=dict(color=color, width=1.5, dash="dot"),
+            ))
+
+    if "Bollinger Bands" in selected:
+        upper, mid, lower = _ind_bbands(px_series)
+        overlay_traces.append(go.Scatter(
+            x=dates, y=upper.values, name="BB Upper",
+            line=dict(color="#94a3b8", width=1, dash="dash"), showlegend=True,
+        ))
+        overlay_traces.append(go.Scatter(
+            x=dates, y=lower.values, name="BB Lower",
+            line=dict(color="#94a3b8", width=1, dash="dash"),
+            fill="tonexty", fillcolor="rgba(148,163,184,0.08)", showlegend=True,
+        ))
+
+    # ── RSI subplot ───────────────────────────────────────────────────────────
+    if show_rsi:
+        rsi = _ind_rsi(px_series, period=rsi_period)
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(go.Scatter(
+            x=dates, y=rsi.values, name=f"RSI({rsi_period})",
+            line=dict(color="#f97316", width=1.8),
+        ))
+        fig_rsi.add_hline(y=70, line_color="#f87171", line_dash="dash", line_width=1,
+                          annotation_text="Overbought (70)", annotation_position="right",
+                          annotation_font=dict(color="#f87171", size=10))
+        fig_rsi.add_hline(y=30, line_color="#4ade80", line_dash="dash", line_width=1,
+                          annotation_text="Oversold (30)", annotation_position="right",
+                          annotation_font=dict(color="#4ade80", size=10))
+        fig_rsi.update_layout(
+            title=f"RSI ({rsi_period})", height=180,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#ccc"), showlegend=False,
+            margin=dict(t=30, b=20, l=10, r=60),
+            yaxis=dict(range=[0, 100], showgrid=True, gridcolor="#2a2a3e",
+                       tickvals=[30, 50, 70]),
+            xaxis=dict(showgrid=False),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_rsi, width='stretch')
+
+    # ── MACD subplot ──────────────────────────────────────────────────────────
+    if show_macd:
+        _slow = max(macd_slow, macd_fast + 1)   # ensure slow > fast
+        macd_line, signal_line, histogram = _ind_macd(px_series, macd_fast, _slow, macd_sig)
+        hist_colors = ["#4ade80" if v >= 0 else "#f87171" for v in histogram.fillna(0)]
+        fig_macd = go.Figure()
+        fig_macd.add_trace(go.Bar(
+            x=dates, y=histogram.values, name="Histogram",
+            marker_color=hist_colors, opacity=0.7,
+        ))
+        fig_macd.add_trace(go.Scatter(
+            x=dates, y=macd_line.values, name=f"MACD({macd_fast},{_slow})",
+            line=dict(color="#60a5fa", width=1.8),
+        ))
+        fig_macd.add_trace(go.Scatter(
+            x=dates, y=signal_line.values, name=f"Signal({macd_sig})",
+            line=dict(color="#f97316", width=1.4, dash="dot"),
+        ))
+        fig_macd.add_hline(y=0, line_color="#555", line_dash="dash", line_width=1)
+        fig_macd.update_layout(
+            title=f"MACD ({macd_fast}, {_slow}, {macd_sig})", height=200,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#ccc"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            margin=dict(t=30, b=20, l=10, r=10),
+            yaxis=dict(showgrid=True, gridcolor="#2a2a3e"),
+            xaxis=dict(showgrid=False),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_macd, width='stretch')
+
+    return overlay_traces
+
+
+_METRIC_TIPS: dict[str, str] = {
+    # Portfolio summary
+    "Account Total":        "Total value of the account: market value of all holdings plus cash balance.",
+    "Invested (Market)":    "Current market value of all open stock positions (excludes cash).",
+    "Cash Balance":         "Uninvested cash sitting in the account.",
+    "Unrealized Gain":      "Paper gain or loss on open positions. Not taxed until you sell.",
+    "Total Gain / Loss":    "Combined total of unrealized gains, realized gains, dividends, and lending income since inception.",
+    "Total Deposited":      "Sum of all cash deposits made into the account.",
+    "Realized Gains":       "Profit or loss locked in by selling positions.",
+    "Dividends Received":   "Total dividend and capital gains distribution income received.",
+    "Stock Lending Income": "Income earned by lending your shares to short-sellers via your broker.",
+    # Position metrics
+    "Avg Cost":             "Average price paid per share, weighted across all open lots.",
+    "Cost Basis":           "Total amount paid for all currently held shares.",
+    "Market Value":         "Current value of the position at today's live price.",
+    "Unrealized":           "Paper gain or loss on this position. Not taxed until sold.",
+    "Realized Gain":        "Profit or loss locked in when shares were sold.",
+    "Dividends":            "Total dividends received from this ticker.",
+    "Live Price":           "Most recent market price per share.",
+    "Shares":               "Number of shares currently held.",
+    # Returns
+    "Ann. TWR":             "Annualized Time-Weighted Return. Measures performance independent of cash flows — the best apples-to-apples comparison against benchmarks.",
+    "Ann. MWR":             "Annualized Money-Weighted Return (IRR). Reflects the return on YOUR actual invested dollars, weighted by timing. Higher than TWR = you timed purchases well.",
+    "Period Start Value":   "Portfolio or position value at the start of the selected period.",
+    "Period End Value":     "Portfolio or position value at the end of the selected period.",
+    "Period Return $":      "Dollar gain or loss during the period, excluding new cash invested.",
+    "Portfolio TWR":        "Time-Weighted Return for the full portfolio over the selected period.",
+    "Start Value":          "Portfolio value at the start of the selected period.",
+    "End Value":            "Portfolio value at the end of the selected period.",
+    # Fundamentals
+    "P/E (TTM)":            "Price-to-Earnings ratio using trailing 12-month earnings. Lower may mean cheaper, but varies by sector and growth rate.",
+    "Forward P/E":          "P/E based on next year's estimated earnings. Lower than trailing P/E implies analysts expect earnings growth.",
+    "Market Cap":           "Total market value of all outstanding shares (share price × shares outstanding).",
+    "Avg Target":           "Mean analyst 12-month price target across all covering analysts.",
+    "High Target":          "Most optimistic analyst price target.",
+    "Low Target":           "Most pessimistic analyst price target.",
+    "ROIC":                 "Return on Invested Capital = Operating Cash Flow ÷ (Total Assets − Cash). Measures how efficiently the business converts capital into cash. >10% is generally strong.",
+    "Quality Score":        "Composite 0–100 score across 8 checks: gross margin, operating margin, FCF margin, ROIC, net cash position, revenue growth, earnings growth, and debt level. Each check is worth 12.5 pts.",
+    # Balance sheet
+    "Cash & Equiv.":        "Cash and short-term investments on the balance sheet.",
+    "Total Debt":           "All short-term and long-term interest-bearing debt.",
+    "Net Cash":             "Cash minus total debt. Positive = more cash than debt (fortress balance sheet).",
+    "Total Assets":         "Everything the company owns: cash, inventory, property, intangibles.",
+    "Revenue (TTM)":        "Total revenue over the trailing 12 months.",
+    "Free Cash Flow":       "Cash generated after capital expenditures. Often considered the 'real' earnings — harder to manipulate than net income.",
+    # DCF
+    "Intrinsic Value (base)": "DCF fair value per share using base-case assumptions (10% growth, 10% discount rate, 3% terminal growth, 10 years).",
+    "After 25% Margin of Safety": "Intrinsic value discounted by 25% — the price at which the DCF model says the stock offers a margin of safety against model error.",
+    # Performance tab
+    "Next Earnings Report": "The next scheduled date when the company reports quarterly financial results. Stock prices often move sharply around earnings.",
+}
+
+
+def metric_card(label, value, sub=None, sub_color=None, tooltip=None):
     color = sub_color or "neutral"
     sub_html = f'<div class="metric-label" style="margin-top:4px">{sub}</div>' if sub else ""
+    tip = tooltip or _METRIC_TIPS.get(label)
+    tip_html = (f'<span title="{tip}" style="cursor:help;color:#555;font-size:0.7rem;'
+                f'margin-left:5px;vertical-align:middle">ⓘ</span>'
+                if tip else "")
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">{label}</div>
+        <div class="metric-label">{label}{tip_html}</div>
         <div class="metric-value {color}">{value}</div>
         {sub_html}
     </div>
@@ -515,8 +1206,8 @@ def _align_benchmark(raw: dict, port_dates: list, start_value: float):
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_positions, tab_performance, tab_dividends, tab_transactions, tab_import, tab_manage, tab_lookup = st.tabs([
-    "📊  Overview", "💼  Positions", "📈  Performance", "📅  Dividends", "🗒  Transactions", "📥  Import", "✏️  Manage", "🔍  Lookup"
+tab_overview, tab_performance, tab_positions, tab_dividends, tab_compare, tab_watchlist, tab_lookup, tab_transactions, tab_import, tab_manage = st.tabs([
+    "📊  Overview", "📈  Performance", "💼  Positions", "📅  Dividends", "⚖️  Compare", "👁  Watchlist", "🔍  Lookup", "🗒  Transactions", "📥  Import", "✏️  Manage"
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -531,9 +1222,9 @@ with tab_overview:
         metric_card("Account Total", _fmt_dollar(s["account_total"]),
                     sub=f"as of {s['as_of']}")
     with c2:
-        metric_card("Invested (Market)", _fmt_dollar(s["total_market_value"]))
+        metric_card("Invested (Market)", _fmt_dollar(s["total_market_value"]), sub="&nbsp;")
     with c3:
-        metric_card("Cash Balance", _fmt_dollar(s["cash_balance"]))
+        metric_card("Cash Balance", _fmt_dollar(s["cash_balance"]), sub="&nbsp;")
     with c4:
         metric_card("Unrealized Gain",
                     _fmt_dollar(s["total_unrealized"], signed=True),
@@ -550,7 +1241,7 @@ with tab_overview:
     _stock_thresh_frac = _stock_thresh / 100.0
     _sector_thresh_frac= _sector_thresh / 100.0
 
-    if _port_total > 0 and s["open_positions"]:
+    if _conc_enabled and _port_total > 0 and s["open_positions"]:
         # Per-stock alerts
         _concentrated = [
             p for p in s["open_positions"]
@@ -618,6 +1309,31 @@ with tab_overview:
             showlegend=False,
         )
         st.plotly_chart(fig_bar, width='stretch')
+
+        # ── Capital composition bar ───────────────────────────────────────────
+        _acct_total = s.get("account_total") or 0
+        _cost       = s.get("total_cost_basis") or 0
+        _profit     = _acct_total - _cost
+        if _acct_total > 0:
+            _cost_pct   = _cost   / _acct_total * 100
+            _profit_pct = _profit / _acct_total * 100
+            _p_color    = "#4ade80" if _profit >= 0 else "#f87171"
+            _p_label    = "Profit" if _profit >= 0 else "Loss"
+            st.markdown(
+                f"<div style='margin-top:4px'>"
+                f"<div style='font-size:0.72rem;color:#888;margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em'>"
+                f"Capital Composition &nbsp;·&nbsp; "
+                f"<span style='color:#94a3b8'>{_cost_pct:.1f}% at cost</span>"
+                f" &nbsp;/&nbsp; "
+                f"<span style='color:{_p_color}'>{abs(_profit_pct):.1f}% {_p_label.lower()}"
+                f" ({_fmt_dollar(_profit, signed=True)})</span>"
+                f"</div>"
+                f"<div style='display:flex;height:10px;border-radius:5px;overflow:hidden'>"
+                f"<div style='width:{_cost_pct:.1f}%;background:#475569'></div>"
+                f"<div style='width:{abs(_profit_pct):.1f}%;background:{_p_color};opacity:0.8'></div>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
 
     with col_right:
         # Holdings pie chart
@@ -754,7 +1470,7 @@ with tab_overview:
 # TAB 2 — Positions
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_positions:
-    open_pos   = summary["open_positions"]
+    open_pos   = all_open_positions   # includes excluded — cards show badge, detail view still works
     closed_pos = summary["closed_positions"]
 
     if "selected_ticker" not in st.session_state:
@@ -819,13 +1535,36 @@ with tab_positions:
 
         # Fundamentals from Yahoo Finance
         funds = (fundamentals or {}).get(t, {})
-        _pe  = funds.get("pe")
-        _mc  = funds.get("market_cap")
-        _tgt = funds.get("target_mean")
+        _pe   = funds.get("pe")
+        _mc   = funds.get("market_cap")
+        _tgt  = funds.get("target_mean")
+        _roic = _calc_roic(funds)
+        _qs, _qs_details, _qs_growth = _calc_quality_score(funds)
 
-        pe_str  = f"{_pe:.1f}x"   if _pe  else "—"
-        mc_str  = _fmt_large(_mc)
-        tgt_str = f"${_tgt:.2f}"          if _tgt else "—"
+        pe_str   = f"{_pe:.1f}x"  if _pe   else "—"
+        mc_str   = _fmt_large(_mc)
+        tgt_str  = f"${_tgt:.2f}" if _tgt  else "—"
+        roic_str    = f"{_roic*100:.1f}%" if _roic is not None else "—"
+        qs_color    = _quality_color(_qs)
+        qs_str      = str(_qs) if _qs is not None else "—"
+        _earn_str   = _fmt_earnings_date(funds)
+        _equity     = _is_equity(funds)
+        _quote_type = funds.get("quote_type", "EQUITY").upper()
+        _is_etf     = _quote_type in ("ETF", "MUTUALFUND")
+        _sector     = funds.get("sector", "") or ""
+        _type_badge = ('<span style="background:#1e3a5f;color:#60a5fa;border-radius:4px;'
+                       'padding:2px 7px;font-size:0.7rem;font-weight:700">ETF</span>'
+                       if _is_etf else '<span></span>')
+        _sector_badge = ""
+        # Compact date format for card: "7/28/26"
+        _earn_short = ""
+        if _earn_str and _equity:
+            try:
+                _ed = datetime.strptime(_earn_str.split(" · ")[0].strip(), "%b %d, %Y")
+                _earn_short = f"{_ed.month}/{_ed.day}/{str(_ed.year)[2:]}"
+            except Exception:
+                _earn_short = ""
+        earn_html   = ""
 
         # Annualized TWR + MWR (full history)
         twr_data   = twrs.get(t, {})
@@ -859,7 +1598,7 @@ with tab_positions:
         bar = _52bar(t, week52)
         name_html = f'<div style="font-size:0.75rem;color:#888;margin-top:2px">{full_name}</div>' if full_name and full_name != t else ""
         ltcg = _all_lots_long_term(p.get("open_lots", []))
-        ltcg_html = '<span title="All lots held &gt; 1 year — Long-Term Capital Gains" style="font-size:1.1rem;cursor:default">⭐</span>' if ltcg else ""
+        ltcg_html = '<span title="All lots held over 1 year - Long-Term Capital Gains" style="font-size:1.1rem;cursor:default">⭐</span>' if ltcg else ""
 
         _dl_info = delisted.get(t.upper())
         if _dl_info is not None:
@@ -869,12 +1608,17 @@ with tab_positions:
         else:
             delisted_badge = ""
 
+        _is_excl = t in excluded
+        excl_badge = ""
+        card_opacity = "opacity:0.6;" if _is_excl else ""
+
         st.markdown(f"""
-        <div class="pos-card">
+        <div class="pos-card" style="{card_opacity}">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span class="pos-ticker">{t}</span>
             <span class="pos-price">{lp}</span>
             <span class="{badge_cls}">{sign}{unrp:.2f}%</span>
+            {_type_badge}
             {ltcg_html}
             {delisted_badge}
           </div>
@@ -895,40 +1639,59 @@ with tab_positions:
             <div class="pos-kv"><div class="pos-k">{twr_label}</div><div class="{twr_cls}">{twr_str}</div></div>
             <div class="pos-kv"><div class="pos-k">{mwr_label}</div><div class="{mwr_cls}">{mwr_str}</div></div>
           </div>
+          {f'''
           <div class="pos-row">
             <div class="pos-kv"><div class="pos-k">P/E (TTM)</div><div class="pos-v">{pe_str}</div></div>
             <div class="pos-kv"><div class="pos-k">Mkt Cap</div><div class="pos-v">{mc_str}</div></div>
             <div class="pos-kv"><div class="pos-k">Avg Target</div><div class="pos-v">{tgt_str}</div></div>
           </div>
+          <div class="pos-row">
+            <div class="pos-kv"><div class="pos-k">ROIC</div><div class="pos-v">{roic_str}</div></div>
+            <div class="pos-kv">
+              <div class="pos-k">Quality Score</div>
+              <div style="margin-top:4px;display:flex;align-items:center;gap:8px">
+                <span style="font-size:1.1rem;font-weight:800;color:{qs_color}">{qs_str}</span>
+                <span style="font-size:0.72rem;color:#666">/ 100</span>
+              </div>
+            </div>
+            <div class="pos-kv">
+              <div class="pos-k">Earnings Date</div>
+              <div class="pos-v">{_earn_short if _earn_short else "—"}</div>
+            </div>
+          </div>''' if _equity else '''
+          <div style="min-height:56px"></div>
+          <div style="min-height:56px"></div>'''}
           {bar}
         </div>""", unsafe_allow_html=True)
 
-        btn_c1, btn_c2 = st.columns(2)
-        with btn_c1:
-            if st.button("View Details →", key=f"det_{t}", width='stretch'):
-                st.session_state["selected_ticker"] = t
-                st.rerun()
-        with btn_c2:
-            if st.button("Exclude ✕", key=f"excl_{t}", width='stretch'):
-                _excl = load_excluded_positions()
-                _excl.add(t)
-                save_excluded_positions(_excl)
-                st.rerun()
+        if st.button("View Details →", key=f"det_{t}", width='stretch'):
+            st.session_state["selected_ticker"] = t
+            st.rerun()
 
     # ── detail view ────────────────────────────────────────────────────────
 
     def _show_detail(ticker, names=None):
         pos = next((p for p in open_pos + closed_pos if p["ticker"] == ticker), None)
 
-        if st.button("← Back to Positions"):
-            st.session_state["selected_ticker"] = None
-            st.rerun()
+        _back_col, _excl_col = st.columns([3, 1])
+        with _back_col:
+            if st.button("← Back to Positions"):
+                st.session_state["selected_ticker"] = None
+                st.rerun()
+        with _excl_col:
+            if st.button("Exclude from Portfolio ✕", key=f"excl_det_{ticker}", width='stretch'):
+                _excl = load_excluded_positions()
+                _excl.add(ticker)
+                save_excluded_positions(_excl)
+                st.session_state["selected_ticker"] = None
+                st.rerun()
 
         if names and ticker in names:
             det_name = names[ticker]
         else:
             det_name = load_ticker_names((ticker,)).get(ticker, "")
-        det_funds = load_ticker_fundamentals((ticker,)).get(ticker, {})
+        det_funds    = load_ticker_fundamentals((ticker,)).get(ticker, {})
+        det_extended = load_ticker_extended(ticker)
         _det_lp = pos.get("live_price") if pos else None
         _det_lp_str = f"${_det_lp:,.4f}" if _det_lp else ""
         _det_lots = pos.get("open_lots", []) if pos else []
@@ -943,12 +1706,12 @@ with tab_positions:
             is_open = pos["shares_held"] > 1e-9
             c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
-                metric_card("Shares", f"{pos['shares_held']:.4f}")
+                metric_card("Shares", f"{pos['shares_held']:.4f}", sub="&nbsp;")
             with c2:
-                metric_card("Avg Cost", f"${pos['avg_cost']:.4f}")
+                metric_card("Avg Cost", f"${pos['avg_cost']:.4f}", sub="&nbsp;")
             with c3:
                 metric_card("Market Value",
-                            _fmt_dollar(pos.get("market_value")) if is_open else "—")
+                            _fmt_dollar(pos.get("market_value")) if is_open else "—", sub="&nbsp;")
             with c4:
                 unr = pos.get("unrealized_gain")
                 metric_card("Unrealized",
@@ -961,57 +1724,224 @@ with tab_positions:
                             sub=f"Dividends: {_fmt_dollar(pos.get('dividends', 0))}",
                             sub_color=_color_class(rz))
 
+            _det_equity = _is_equity(det_funds)
             _pe      = det_funds.get("pe")
             _fwd_pe  = det_funds.get("fwd_pe")
             _mc      = det_funds.get("market_cap")
             _tgt_avg = det_funds.get("target_mean")
             _tgt_hi  = det_funds.get("target_high")
             _tgt_lo  = det_funds.get("target_low")
+            _det_roic = _calc_roic(det_funds)
+            _det_qs, _det_qs_details, _det_qs_growth = _calc_quality_score(det_funds)
 
-            fa, fb, fc, fd, fe, ff = st.columns(6)
-            with fa:
-                metric_card("P/E (TTM)", f"{_pe:.1f}x" if _pe else "—")
-            with fb:
-                metric_card("Forward P/E", f"{_fwd_pe:.1f}x" if _fwd_pe else "—")
-            with fc:
-                metric_card("Market Cap", _fmt_large(_mc))
-            with fd:
-                metric_card("Avg Target", f"${_tgt_avg:.2f}" if _tgt_avg else "—")
-            with fe:
-                metric_card("High Target", f"${_tgt_hi:.2f}" if _tgt_hi else "—")
-            with ff:
-                metric_card("Low Target", f"${_tgt_lo:.2f}" if _tgt_lo else "—")
+            if _det_equity:
+                fa, fb, fc, fd, fe, ff = st.columns(6)
+                with fa:
+                    metric_card("P/E (TTM)", f"{_pe:.1f}x" if _pe else "—")
+                with fb:
+                    metric_card("Forward P/E", f"{_fwd_pe:.1f}x" if _fwd_pe else "—")
+                with fc:
+                    metric_card("Market Cap", _fmt_large(_mc))
+                with fd:
+                    metric_card("Avg Target", f"${_tgt_avg:.2f}" if _tgt_avg else "—")
+                with fe:
+                    metric_card("High Target", f"${_tgt_hi:.2f}" if _tgt_hi else "—")
+                with ff:
+                    metric_card("Low Target", f"${_tgt_lo:.2f}" if _tgt_lo else "—")
 
-            # ── Balance sheet snapshot ────────────────────────────────────────
+            if _det_equity:
+                # ROIC + Quality Score row
+                _roic_str = f"{_det_roic*100:.1f}%" if _det_roic is not None else "—"
+                _qs_color = _quality_color(_det_qs)
+                ga, gb = st.columns([1, 5])
+                with ga:
+                    _roic_color = ("neutral" if _det_roic is None else
+                                   ("positive" if _det_roic >= 0.10 else "negative"))
+                    st.markdown(f"""
+                    <div class="metric-card" style="height:100%;box-sizing:border-box">
+                        <div class="metric-label">ROIC</div>
+                        <div class="metric-value {_roic_color}">{_roic_str}</div>
+                        <div class="metric-label" style="margin-top:4px">OCF / (Assets − Cash)</div>
+                    </div>""", unsafe_allow_html=True)
+                with gb:
+                    if _det_qs is not None:
+                        _qs_bar_html = "".join(
+                            f'<span title="{lbl}" style="display:inline-block;width:10px;height:10px;'
+                            f'border-radius:2px;margin:1px;background:'
+                            f'{"#4ade80" if passed is True else "#f87171" if passed is False else "#444"}'
+                            f'"></span>'
+                            for lbl, passed, _act in _det_qs_details
+                        )
+                        _gp_banner = (
+                            "<div style='margin-top:8px;padding:5px 8px;border-radius:5px;"
+                            "background:#1a2a1a;border:1px solid #2d4a2d;font-size:0.72rem;color:#86efac'>"
+                            "⚡ Growth Phase — strong revenue growth detected. Low FCF/earnings checks "
+                            "may reflect deliberate reinvestment, not a weak business.</div>"
+                        ) if _det_qs_growth else ""
+                        st.markdown(f"""
+                        <div class="metric-card">
+                          <div class="metric-label">Quality Score</div>
+                          <div style="display:flex;align-items:baseline;gap:8px;margin-top:4px">
+                            <span style="font-size:1.6rem;font-weight:700;color:{_qs_color}">{_det_qs}</span>
+                            <span style="color:#666;font-size:0.85rem">/ 100</span>
+                            <span style="margin-left:8px">{_qs_bar_html}</span>
+                          </div>
+                          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px 16px;margin-top:6px">
+                            {"".join(
+                                f'<div style="font-size:0.72rem;color:{"#4ade80" if p is True else "#f87171" if p is False else "#555"}">'
+                                f'{"✓" if p is True else "✗" if p is False else "·"} {l}'
+                                f'{"<br><span style=\'color:#aaa;font-size:0.68rem\'>" + a + "</span>" if a else ""}'
+                                f'</div>'
+                                for l, p, a in _det_qs_details
+                            )}
+                          </div>
+                          {_gp_banner}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        metric_card("Quality Score", "—", sub="Insufficient data")
+
+            # ── Balance sheet snapshot (equity only) ──────────────────────────
             _cash     = det_funds.get("total_cash")
             _debt     = det_funds.get("total_debt")
             _assets   = det_funds.get("total_assets")
             _rev      = det_funds.get("total_revenue")
             _fcf      = det_funds.get("free_cashflow")
             _ocf      = det_funds.get("oper_cashflow")
-            _has_bs   = any(v is not None for v in [_cash, _debt, _assets, _rev, _fcf, _ocf])
+            _has_bs   = _det_equity and any(v is not None for v in [_cash, _debt, _assets, _rev, _fcf, _ocf])
             if _has_bs:
                 _net_cash = (_cash - _debt) if (_cash is not None and _debt is not None) else None
                 _net_cash_color = _color_class(_net_cash)
                 ba, bb, bc, bd, be, bf = st.columns(6)
                 with ba:
-                    metric_card("Cash & Equiv.", _fmt_large(_cash))
+                    metric_card("Cash & Equiv.", _fmt_large(_cash), sub="&nbsp;")
                 with bb:
-                    metric_card("Total Debt", _fmt_large(_debt))
+                    metric_card("Total Debt", _fmt_large(_debt), sub="&nbsp;")
                 with bc:
                     _nc_str = _fmt_large(abs(_net_cash)) if _net_cash is not None else "—"
                     if _net_cash is not None:
                         _nc_str = ("+" if _net_cash >= 0 else "-") + _nc_str
-                    metric_card("Net Cash", _nc_str, sub_color=_net_cash_color)
+                    metric_card("Net Cash", _nc_str, sub="&nbsp;", sub_color=_net_cash_color)
                 with bd:
-                    metric_card("Total Assets", _fmt_large(_assets))
+                    metric_card("Total Assets", _fmt_large(_assets), sub="&nbsp;")
                 with be:
-                    metric_card("Revenue (TTM)", _fmt_large(_rev))
+                    metric_card("Revenue (TTM)", _fmt_large(_rev), sub="&nbsp;")
                 with bf:
                     _fcf_str = _fmt_large(abs(_fcf)).replace("$", ("$+" if _fcf and _fcf >= 0 else "$")) if _fcf is not None else "—"
                     metric_card("Free Cash Flow", _fmt_large(_fcf),
                                 sub=f"Operating: {_fmt_large(_ocf)}" if _ocf else None,
                                 sub_color=_color_class(_fcf))
+
+            # ── Earnings date (equity only) ───────────────────────────────────
+            _earn_str_det = _fmt_earnings_date(det_funds) if _det_equity else ""
+            if not _earn_str_det and _det_equity and det_extended.get("earnings_date"):
+                _earn_str_det = det_extended["earnings_date"].strftime("%b %d, %Y")
+            if _earn_str_det:
+                st.markdown(f"""
+                <div class="metric-card" style="display:inline-block;padding:10px 20px;margin-top:8px">
+                  <div class="metric-label">Next Earnings Report</div>
+                  <div style="font-size:1.2rem;font-weight:700;color:#fbbf24;margin-top:4px">
+                    📅 {_earn_str_det}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Annual financial history (equity only) ────────────────────────────
+        _annual = det_extended.get("annual", {})
+        if _annual and _det_equity:
+            st.divider()
+            st.subheader("Annual Financial History")
+            st.caption("Source: yfinance annual income statement & cash flow. Typically 4–5 years available.")
+            _hist_rows = []
+            for _yr in sorted(_annual.keys(), reverse=True):
+                _r = _annual[_yr]
+                _rev_v  = _r.get("revenue")
+                _gp_v   = _r.get("gross_profit")
+                _ni_v   = _r.get("net_income")
+                _fcf_v  = _r.get("fcf")
+                _ocf_v  = _r.get("ocf")
+                _gm_v   = (_gp_v / _rev_v * 100) if (_gp_v and _rev_v and _rev_v > 0) else None
+                _fcfm_v = (_fcf_v / _rev_v * 100) if (_fcf_v and _rev_v and _rev_v > 0) else None
+                _hist_rows.append({
+                    "Year":         int(_yr),
+                    "Revenue":      _rev_v,
+                    "Gross Profit": _gp_v,
+                    "Net Income":   _ni_v,
+                    "FCF":          _fcf_v,
+                    "OCF":          _ocf_v,
+                    "Gross Margin": _gm_v,
+                    "FCF Margin":   _fcfm_v,
+                })
+            if _hist_rows:
+                _df_hist = pd.DataFrame(_hist_rows)
+
+                def _color_hist(val):
+                    if pd.isna(val) or val == 0: return ""
+                    return "color: #4ade80" if val > 0 else "color: #f87171"
+
+                _fmt_hist = {
+                    "Revenue":      lambda v: _fmt_large(v) if pd.notna(v) else "—",
+                    "Gross Profit": lambda v: _fmt_large(v) if pd.notna(v) else "—",
+                    "Net Income":   lambda v: _fmt_large(v) if pd.notna(v) else "—",
+                    "FCF":          lambda v: _fmt_large(v) if pd.notna(v) else "—",
+                    "OCF":          lambda v: _fmt_large(v) if pd.notna(v) else "—",
+                    "Gross Margin": lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+                    "FCF Margin":   lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+                }
+                _styled_hist = (
+                    _df_hist.style
+                    .map(_color_hist, subset=["Net Income", "FCF"])
+                    .format(_fmt_hist, na_rep="—")
+                )
+                st.dataframe(_styled_hist, width='stretch', hide_index=True)
+
+        # ── Share dilution (equity only) ─────────────────────────────────────
+        _share_rows = [
+            (yr, _annual[yr].get("shares") or _annual[yr].get("shares_diluted"))
+            for yr in sorted(_annual.keys(), reverse=True)
+            if _annual[yr].get("shares") or _annual[yr].get("shares_diluted")
+        ]
+        if len(_share_rows) >= 2 and _det_equity:
+            st.divider()
+            st.subheader("Share Count Trend  (Dilution Check)")
+            st.caption("Rising share count = dilution (bad). Falling = buybacks (good).")
+            _dil_rows = []
+            for i, (yr, sh) in enumerate(_share_rows):
+                prev_sh = _share_rows[i + 1][1] if i + 1 < len(_share_rows) else None
+                yoy_pct = ((sh - prev_sh) / prev_sh * 100) if (prev_sh and prev_sh > 0) else None
+                _dil_rows.append({
+                    "Year":              int(yr),
+                    "Shares Outstanding": sh,
+                    "YoY Change":        yoy_pct,
+                })
+            _df_dil = pd.DataFrame(_dil_rows)
+
+            def _color_dilution(val):
+                if pd.isna(val) or val == 0: return ""
+                # Dilution is bad (red), buybacks are good (green)
+                return "color: #f87171" if val > 0 else "color: #4ade80"
+
+            def _fmt_shares(v):
+                if pd.isna(v): return "—"
+                if v >= 1e9:  return f"{v/1e9:.3f}B"
+                if v >= 1e6:  return f"{v/1e6:.2f}M"
+                return f"{v:,.0f}"
+
+            _styled_dil = (
+                _df_dil.style
+                .map(_color_dilution, subset=["YoY Change"])
+                .format({
+                    "Shares Outstanding": _fmt_shares,
+                    "YoY Change":         lambda v: f"{v:+.2f}%" if pd.notna(v) else "—",
+                }, na_rep="—")
+            )
+            st.dataframe(_styled_dil, width='stretch', hide_index=True)
+
+        # ── DCF Fair Value (equity only) ──────────────────────────────────────
+        if _det_equity:
+            st.divider()
+            st.subheader("DCF Fair Value Model")
+            _det_live_px = pos.get("live_price") if pos else None
+            _render_dcf(ticker, _det_live_px, det_funds, key_prefix=f"det_{ticker}")
 
         st.divider()
         st.caption(f"Period: **{period}** — change via the sidebar selector")
@@ -1075,8 +2005,8 @@ with tab_positions:
                 return None
 
             # Gather buy / sell / split events from transaction history for this ticker
-            _buy_types  = {"buy", "crypto_buy", "transfer_in", "dividend_reinvestment"}
-            _sell_types = {"sell", "crypto_sell"}
+            _buy_types  = BUY_TYPES | TRANSFER_IN_TYPES
+            _sell_types = SELL_TYPES
             _tx_all = load_transactions(tuple(selected_dbs), selected_account, ticker, None)
 
             # price_dict: split-adjusted display prices (smooth, no plummet at split)
@@ -1130,6 +2060,17 @@ with tab_positions:
 
             # ── Price chart ──────────────────────────────────────────────────
             if tc.get("prices"):
+                # Indicator selector
+                _ind_sel = st.multiselect(
+                    "Technical indicators",
+                    ["MA(20)", "MA(50)", "MA(200)", "Bollinger Bands", "RSI", "MACD"],
+                    default=["RSI"],
+                    key=f"ind_{ticker}",
+                    label_visibility="collapsed",
+                    placeholder="Add technical indicators…",
+                    help="MA(N): Moving average over N days — smooths price noise. Price above MA = uptrend. | Bollinger Bands: ±2 standard deviations from 20-day MA — near upper band = overbought, near lower = oversold. | RSI: Momentum oscillator 0–100. >70 overbought, <30 oversold. Period is adjustable. | MACD: Trend-following momentum indicator. Fast/slow/signal periods are adjustable.",
+                )
+
                 fig_price = go.Figure()
                 fig_price.add_trace(go.Scatter(
                     x=tc["dates"], y=tc["prices"],
@@ -1161,6 +2102,12 @@ with tab_positions:
                         text=f"Split {_sq}:1", showarrow=False,
                         font=dict(color="#fbbf24", size=10), xanchor="center",
                     )
+                # Add overlay traces (MA, BB)
+                _overlay = _render_indicators(tc["dates"], tc["prices"], _ind_sel,
+                                              key_prefix=f"ind_{ticker}")
+                for _tr in _overlay:
+                    fig_price.add_trace(_tr)
+
                 fig_price.update_layout(
                     title=f"{ticker} — Share Price (split-adjusted)",
                     height=340,
@@ -1364,7 +2311,9 @@ with tab_positions:
         _show_detail(st.session_state["selected_ticker"], names=_all_names)
     else:
         # Open positions grid
-        st.subheader(f"Open Positions  ({len(open_pos)})")
+        _n_excl = sum(1 for p in open_pos if p["ticker"] in excluded)
+        _excl_suffix = f"  ·  {_n_excl} excluded" if _n_excl else ""
+        st.subheader(f"Open Positions  ({len(open_pos)}){_excl_suffix}")
         if open_pos:
             tickers_open = [p["ticker"] for p in open_pos]
             week52 = load_52week(tuple(tickers_open))
@@ -1507,9 +2456,9 @@ with tab_positions:
         all_excl = load_excluded_positions()
         if all_excl:
             st.divider()
-            st.subheader("Excluded from Portfolio")
-            st.caption("These positions are hidden from cards and removed from all portfolio totals. "
-                       "Their transaction history is preserved in the database.")
+            st.subheader("Re-include Excluded Positions")
+            st.caption("Excluded positions still appear as cards above (marked EXCLUDED) and removed from all portfolio totals. "
+                       "Click to re-include.")
             excl_cols = st.columns(min(len(all_excl), 6))
             for col, ticker in zip(excl_cols, sorted(all_excl)):
                 with col:
@@ -1534,9 +2483,9 @@ with tab_performance:
         _perf_dlbl = f" · {_perf_days}d" if _perf_days else ""
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
-            metric_card("Start Value", _fmt_dollar(c["start_value"]))
+            metric_card("Start Value", _fmt_dollar(c["start_value"]), sub="&nbsp;")
         with m2:
-            metric_card("End Value", _fmt_dollar(c["end_value"]))
+            metric_card("End Value", _fmt_dollar(c["end_value"]), sub="&nbsp;")
         with m3:
             true_gain = c["end_value"] - c["start_value"] - c["period_net_flows"]
             nf = c["period_net_flows"]
@@ -1552,15 +2501,15 @@ with tab_performance:
             else:
                 metric_card(f"TWR{_perf_dlbl}",
                             _fmt_pct(c["twr_total"], signed=True),
-                            sub_color=_color_class(c["twr_total"]))
+                            sub="&nbsp;", sub_color=_color_class(c["twr_total"]))
         with m5:
             _pmwr = c.get("mwr_annualized")
             if _pmwr is not None:
                 metric_card(f"Ann. MWR{_perf_dlbl}",
                             _fmt_pct(_pmwr, signed=True),
-                            sub_color=_color_class(_pmwr))
+                            sub="&nbsp;", sub_color=_color_class(_pmwr))
             else:
-                metric_card(f"Ann. MWR{_perf_dlbl}", "—")
+                metric_card(f"Ann. MWR{_perf_dlbl}", "—", sub="&nbsp;")
 
         st.divider()
 
@@ -1826,9 +2775,13 @@ with tab_dividends:
 
         # Build projections for all tickers
         _hist_pos = _all_income[_all_income["_amt"] > 0]
-        _proj_rows = []   # {ym, Ticker, amount, projected=True}
+        _proj_rows = []
+        _single_payment_tickers = []   # tickers skipped due to only 1 payment
         for _tk in _hist_pos["Ticker"].unique():
             _tk_hist = _hist_pos[_hist_pos["Ticker"] == _tk]
+            if len(_tk_hist) == 1:
+                _single_payment_tickers.append(_tk)
+                continue
             for _proj_date, _proj_amt in _project_ticker(_tk_hist):
                 _proj_rows.append({
                     "_date":     _proj_date,
@@ -1852,13 +2805,13 @@ with tab_dividends:
 
         dv1, dv2, dv3, dv4, dv5, dv6 = st.columns(6)
         with dv1:
-            metric_card("Total Income", _fmt_dollar(_total_divs))
+            metric_card("Total Income", _fmt_dollar(_total_divs), sub="&nbsp;")
         with dv2:
-            metric_card(f"{_this_year} YTD", _fmt_dollar(_ytd_divs))
+            metric_card(f"{_this_year} YTD", _fmt_dollar(_ytd_divs), sub="&nbsp;")
         with dv3:
-            metric_card("Trailing 12M", _fmt_dollar(_last_12m))
+            metric_card("Trailing 12M", _fmt_dollar(_last_12m), sub="&nbsp;")
         with dv4:
-            metric_card("Paying Tickers", str(_payers))
+            metric_card("Paying Tickers", str(_payers), sub="&nbsp;")
         with dv5:
             metric_card("Projected 6M", _fmt_dollar(_proj_6m),
                         sub="next 6 months")
@@ -1974,6 +2927,11 @@ with tab_dividends:
                 st.dataframe(_upcoming_disp, width='stretch', hide_index=True)
                 st.caption("Amounts estimated from the average of recent payments. "
                            "Interval detected from historical payment frequency.")
+        if _single_payment_tickers:
+            st.caption(
+                f"⚠️ No projection for {', '.join(sorted(_single_payment_tickers))} — "
+                "only 1 payment recorded; need at least 2 to detect a payment interval."
+            )
 
         st.divider()
 
@@ -2499,6 +3457,77 @@ with tab_manage:
             else:
                 st.warning("Enter a ticker symbol.")
 
+    st.divider()
+    st.subheader("Ticker Renames / Aliases")
+    st.caption("Map an old ticker symbol to a new one for price fetching (e.g. STRV → STXF after a rename). "
+               "Prices will be fetched under the new symbol and stored under the original.")
+
+    st.markdown("**Rename ticker in transactions (permanent):**")
+    st.caption("Updates all transaction records across your account databases. Use this when a stock ticker changes and you want the position to appear under the new name.")
+    with st.form("rename_ticker_form", clear_on_submit=True):
+        _rn1, _rn2 = st.columns(2)
+        with _rn1:
+            _rn_old = st.text_input("Old ticker", placeholder="STRV").upper().strip()
+        with _rn2:
+            _rn_new = st.text_input("New ticker", placeholder="STXF").upper().strip()
+        if st.form_submit_button("Rename in Transactions", type="primary"):
+            if _rn_old and _rn_new and _rn_old != _rn_new:
+                _rn_count = 0
+                for _rn_db in selected_dbs:
+                    try:
+                        _rn_conn = __import__("sqlite3").connect(_rn_db)
+                        _cur = _rn_conn.execute(
+                            "UPDATE transactions SET ticker = ? WHERE UPPER(ticker) = ?",
+                            (_rn_new, _rn_old)
+                        )
+                        _rn_count += _cur.rowcount
+                        _rn_conn.commit()
+                        _rn_conn.close()
+                    except Exception as _e:
+                        st.error(f"Error updating {_rn_db}: {_e}")
+                if _rn_count:
+                    st.cache_data.clear()
+                    st.success(f"Renamed {_rn_count} transaction(s) from {_rn_old} → {_rn_new}. Refresh Data to update prices.")
+                    st.rerun()
+                else:
+                    st.warning(f"No transactions found for {_rn_old}.")
+            else:
+                st.warning("Enter two different ticker symbols.")
+    st.divider()
+
+    _aliases = get_ticker_aliases()
+    if _aliases:
+        st.markdown("**Active aliases:**")
+        for _old, _new in sorted(_aliases.items()):
+            _ac1, _ac2 = st.columns([4, 1])
+            with _ac1:
+                st.markdown(f"`{_old}` → `{_new}`")
+            with _ac2:
+                if st.button("Remove", key=f"rm_alias_{_old}"):
+                    remove_ticker_alias(_old)
+                    st.cache_data.clear()
+                    st.rerun()
+    else:
+        st.info("No ticker aliases defined.")
+
+    st.markdown("**Add a ticker alias:**")
+    with st.form("add_alias_form", clear_on_submit=True):
+        _al1, _al2, _al3 = st.columns([2, 2, 3])
+        with _al1:
+            _al_old = st.text_input("Old ticker (in your transactions)", placeholder="STRV").upper().strip()
+        with _al2:
+            _al_new = st.text_input("New ticker (current Yahoo Finance symbol)", placeholder="STXF").upper().strip()
+        with _al3:
+            _al_notes = st.text_input("Notes", placeholder="e.g. Renamed to STXF Jun 2025")
+        if st.form_submit_button("Add Alias", type="primary"):
+            if _al_old and _al_new:
+                add_ticker_alias(_al_old, _al_new, _al_notes)
+                st.cache_data.clear()
+                st.success(f"Alias added: {_al_old} → {_al_new}. Click Refresh Data to re-fetch prices.")
+                st.rerun()
+            else:
+                st.warning("Enter both old and new ticker symbols.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 7 — Stock Lookup
@@ -2640,6 +3669,17 @@ with tab_lookup:
             ma50  = closes.rolling(50).mean()
             ma200 = closes.rolling(200).mean()
 
+            # Indicator selector
+            _lk_ind_sel = st.multiselect(
+                "Technical indicators",
+                ["MA(20)", "MA(50)", "MA(200)", "Bollinger Bands", "RSI", "MACD"],
+                default=["MA(50)", "MA(200)", "RSI"],
+                key=f"lk_ind_{symbol}",
+                label_visibility="collapsed",
+                placeholder="Add technical indicators…",
+                help="MA(N): Moving average over N days — smooths price noise. Price above MA = uptrend. | Bollinger Bands: ±2 standard deviations from 20-day MA — near upper band = overbought, near lower = oversold. | RSI(14): Momentum oscillator 0–100. >70 overbought, <30 oversold. | MACD(12,26,9): Trend-following momentum. Signal line crossovers indicate potential reversals.",
+            )
+
             fig_lk = _make_subplots(
                 rows=2, cols=1, shared_xaxes=True,
                 vertical_spacing=0.04, row_heights=[0.75, 0.25],
@@ -2654,17 +3694,29 @@ with tab_lookup:
                 increasing_fillcolor="#4ade80", decreasing_fillcolor="#f87171",
             ), row=1, col=1)
 
-            # 50-day MA
-            fig_lk.add_trace(go.Scatter(
-                x=hist.index, y=ma50, name="50d MA",
-                line=dict(color="#fbbf24", width=1.5),
-            ), row=1, col=1)
+            # MA overlays driven by selector
+            _lk_ma_colors = {"MA(20)": "#60a5fa", "MA(50)": "#fbbf24", "MA(200)": "#a78bfa"}
+            for _lk_ma_lbl, _lk_ma_color in _lk_ma_colors.items():
+                if _lk_ma_lbl in _lk_ind_sel:
+                    _lk_period = int(_lk_ma_lbl[3:-1])
+                    _lk_ma_vals = closes.rolling(_lk_period).mean()
+                    if _lk_ma_vals.notna().sum() >= 5:
+                        fig_lk.add_trace(go.Scatter(
+                            x=hist.index, y=_lk_ma_vals, name=_lk_ma_lbl,
+                            line=dict(color=_lk_ma_color, width=1.5),
+                        ), row=1, col=1)
 
-            # 200-day MA (only if enough data)
-            if ma200.notna().sum() >= 10:
+            # Bollinger Bands overlay
+            if "Bollinger Bands" in _lk_ind_sel:
+                _lk_bb_u, _lk_bb_m, _lk_bb_l = _ind_bbands(closes)
                 fig_lk.add_trace(go.Scatter(
-                    x=hist.index, y=ma200, name="200d MA",
-                    line=dict(color="#a78bfa", width=1.5, dash="dot"),
+                    x=hist.index, y=_lk_bb_u, name="BB Upper",
+                    line=dict(color="#94a3b8", width=1, dash="dash"),
+                ), row=1, col=1)
+                fig_lk.add_trace(go.Scatter(
+                    x=hist.index, y=_lk_bb_l, name="BB Lower",
+                    line=dict(color="#94a3b8", width=1, dash="dash"),
+                    fill="tonexty", fillcolor="rgba(148,163,184,0.08)",
                 ), row=1, col=1)
 
             # 52-week high/low reference lines
@@ -2696,6 +3748,11 @@ with tab_lookup:
                 hovermode="x unified",
             )
             st.plotly_chart(fig_lk, width='stretch')
+
+            # RSI / MACD subplots (rendered as separate charts below)
+            _lk_dates_str = [str(d.date()) for d in hist.index]
+            _render_indicators(_lk_dates_str, closes.tolist(), _lk_ind_sel,
+                               key_prefix=f"lk_ind2_{symbol}")
 
             # ── Return comparison vs S&P 500 ──────────────────────────────
             st.subheader("Return vs S&P 500 (1 Year)")
@@ -2730,6 +3787,17 @@ with tab_lookup:
                 )
                 st.plotly_chart(fig_cmp, width='stretch')
 
+            # ── DCF Fair Value ────────────────────────────────────────────
+            _lk_qt = (info.get("quoteType") or "EQUITY").upper()
+            if _lk_qt == "EQUITY":
+                st.divider()
+                st.subheader("DCF Fair Value Model")
+                _lk_funds = {
+                    "free_cashflow":    info.get("freeCashflow"),
+                    "shares_outstanding": info.get("sharesOutstanding"),
+                }
+                _render_dcf(symbol, price, _lk_funds, key_prefix=f"lk_{symbol}")
+
             # ── Fundamentals table ────────────────────────────────────────
             with st.expander("Fundamentals"):
                 fund_data = {
@@ -2763,3 +3831,430 @@ with tab_lookup:
                         st.markdown(f"**{k}:** {v}")
     else:
         st.info("Enter a ticker symbol above and click **Look Up** to see price history and stats.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 9 — Stock Comparison
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_compare:
+    st.subheader("Stock Comparison")
+    st.caption("Compare up to 3 tickers side-by-side. Pick from your positions, watchlist, or enter any ticker.")
+
+    _pos_tickers = sorted(set(p["ticker"] for p in summary["open_positions"]))
+    _wl_tickers_cmp = sorted(set(w["ticker"] for w in load_watchlist()))
+    _wl_only = [t for t in _wl_tickers_cmp if t not in _pos_tickers]
+
+    _CUSTOM = "✏️  Custom ticker…"
+    _cmp_options = [_CUSTOM]
+    if _pos_tickers:
+        _cmp_options += ["── Positions ──"] + _pos_tickers
+    if _wl_only:
+        _cmp_options += ["── Watchlist ──"] + _wl_only
+
+    _SEPARATORS = {"── Positions ──", "── Watchlist ──"}
+
+    def _cmp_picker(label, col_key, default_ticker=None):
+        """Selectbox from positions + watchlist, with custom text-input fallback."""
+        _def_idx = 0
+        if default_ticker and default_ticker in _cmp_options:
+            _def_idx = _cmp_options.index(default_ticker)
+
+        sel = st.selectbox(label, _cmp_options,
+                           index=_def_idx,
+                           key=f"cmp_sel_{col_key}")
+
+        if sel == _CUSTOM or sel in _SEPARATORS:
+            val = st.text_input("Enter ticker", key=f"cmp_txt_{col_key}",
+                                placeholder="e.g. NVDA").upper().strip()
+        else:
+            val = sel
+            # Clear the text box so it doesn't interfere
+            if f"cmp_txt_{col_key}" not in st.session_state:
+                st.session_state[f"cmp_txt_{col_key}"] = ""
+        return val
+
+    cmp_c1, cmp_c2, cmp_c3, cmp_c4 = st.columns([2, 2, 2, 1])
+    with cmp_c1:
+        _def1 = _pos_tickers[0] if _pos_tickers else None
+        cmp_t1 = _cmp_picker("Ticker 1", "1", _def1)
+    with cmp_c2:
+        _def2 = _pos_tickers[1] if len(_pos_tickers) > 1 else None
+        cmp_t2 = _cmp_picker("Ticker 2", "2", _def2)
+    with cmp_c3:
+        cmp_t3 = _cmp_picker("Ticker 3 (optional)", "3", None)
+    with cmp_c4:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        cmp_go = st.button("Compare", type="primary", width="stretch")
+
+    if "cmp_tickers" not in st.session_state:
+        st.session_state["cmp_tickers"] = []
+    if cmp_go:
+        st.session_state["cmp_tickers"] = [t for t in [cmp_t1, cmp_t2, cmp_t3] if t]
+
+    _cmp_list = st.session_state["cmp_tickers"]
+
+    if len(_cmp_list) >= 2:
+        with st.spinner("Fetching data…"):
+            _cmp_funds = load_ticker_fundamentals(tuple(_cmp_list))
+            _cmp_names = load_ticker_names(tuple(_cmp_list))
+            _cmp_ext   = {t: load_ticker_extended(t) for t in _cmp_list}
+
+        # ── Header row ────────────────────────────────────────────────────────
+        _cmp_types = {t: _cmp_funds.get(t, {}).get("quote_type", "EQUITY") for t in _cmp_list}
+        _all_equity = all(v == "EQUITY" for v in _cmp_types.values())
+
+        _hdr_cols = st.columns([2] + [3] * len(_cmp_list))
+        with _hdr_cols[0]:
+            st.markdown("**Metric**")
+        for i, t in enumerate(_cmp_list):
+            _nm  = _cmp_names.get(t, "")
+            _qt  = _cmp_types[t]
+            _qt_badge = "" if _qt == "EQUITY" else f" `{_qt}`"
+            with _hdr_cols[i + 1]:
+                st.markdown(f"**{t}**{_qt_badge}" + (f"  \n<span style='font-size:0.75rem;color:#888'>{_nm}</span>" if _nm and _nm != t else ""),
+                            unsafe_allow_html=True)
+
+        st.divider()
+
+        # Helper to render one metric row
+        def _cmp_row(label, values, fmt_fn=None, better="higher", highlight=True):
+            """
+            values: list aligned to _cmp_list — raw floats or strings.
+            fmt_fn: callable(raw) -> display string. If None, values are already strings.
+            better: "higher" | "lower" | None  — controls which value gets the green highlight.
+            """
+            cols = st.columns([2] + [3] * len(_cmp_list))
+            with cols[0]:
+                st.markdown(f"<span style='font-size:0.82rem;color:#888'>{label}</span>",
+                            unsafe_allow_html=True)
+
+            numeric = [v for v in values if isinstance(v, (int, float)) and v is not None]
+            if highlight and numeric and better in ("higher", "lower"):
+                best = max(numeric) if better == "higher" else min(numeric)
+            else:
+                best = None
+
+            for i, raw in enumerate(values):
+                disp = fmt_fn(raw) if (fmt_fn and raw is not None) else (raw if raw is not None else "—")
+                is_best = (highlight and best is not None
+                           and isinstance(raw, (int, float)) and raw == best
+                           and len(numeric) > 1)
+                color = "#4ade80" if is_best else "#e2e8f0"
+                with cols[i + 1]:
+                    st.markdown(f"<span style='font-size:0.92rem;color:{color}'>{disp}</span>",
+                                unsafe_allow_html=True)
+
+        _pct        = _fmt_pct_raw
+        _pct_signed = _fmt_pct_raw_signed
+        _x          = _fmt_x
+        _shares_fmt = _fmt_shares
+
+        # ── Valuation ─────────────────────────────────────────────────────────
+        st.markdown("#### Valuation")
+        _cmp_row("Price / Earnings (TTM)",
+                 [_cmp_funds.get(t, {}).get("pe") for t in _cmp_list],
+                 fmt_fn=_x, better="lower")
+        _cmp_row("Forward P/E",
+                 [_cmp_funds.get(t, {}).get("fwd_pe") for t in _cmp_list],
+                 fmt_fn=_x, better="lower")
+        _cmp_row("Market Cap",
+                 [_cmp_funds.get(t, {}).get("market_cap") for t in _cmp_list],
+                 fmt_fn=_fmt_large, better=None)
+        if _all_equity:
+            _cmp_row("Analyst Mean Target",
+                     [_cmp_funds.get(t, {}).get("target_mean") for t in _cmp_list],
+                     fmt_fn=lambda v: f"${v:.2f}" if v else "—", better="higher")
+
+        st.divider()
+
+        # ── Profitability ──────────────────────────────────────────────────────
+        st.markdown("#### Profitability")
+        _cmp_row("Gross Margin",
+                 [_cmp_funds.get(t, {}).get("gross_margins") for t in _cmp_list],
+                 fmt_fn=_pct, better="higher")
+        _cmp_row("Operating Margin",
+                 [_cmp_funds.get(t, {}).get("oper_margins") for t in _cmp_list],
+                 fmt_fn=_pct, better="higher")
+        _fcf_margins = []
+        for t in _cmp_list:
+            f = _cmp_funds.get(t, {})
+            fcf, rev = f.get("free_cashflow"), f.get("total_revenue")
+            _fcf_margins.append(fcf / rev if (fcf and rev and rev > 0) else None)
+        _cmp_row("FCF Margin",
+                 _fcf_margins, fmt_fn=_pct, better="higher")
+        if _all_equity:
+            _cmp_row("ROIC",
+                     [_calc_roic(_cmp_funds.get(t, {})) for t in _cmp_list],
+                     fmt_fn=_pct, better="higher")
+
+        st.divider()
+
+        # ── Growth ────────────────────────────────────────────────────────────
+        st.markdown("#### Growth (YoY)")
+        _cmp_row("Revenue Growth",
+                 [_cmp_funds.get(t, {}).get("revenue_growth") for t in _cmp_list],
+                 fmt_fn=_pct_signed, better="higher")
+        _cmp_row("Earnings Growth",
+                 [_cmp_funds.get(t, {}).get("earnings_growth") for t in _cmp_list],
+                 fmt_fn=_pct_signed, better="higher")
+
+        st.divider()
+
+        # ── Balance Sheet ──────────────────────────────────────────────────────
+        st.markdown("#### Balance Sheet")
+        _net_cash = []
+        for t in _cmp_list:
+            f = _cmp_funds.get(t, {})
+            c, d = f.get("total_cash"), f.get("total_debt")
+            _net_cash.append((c - d) if (c is not None and d is not None) else None)
+        _cmp_row("Net Cash (Cash − Debt)",
+                 _net_cash, fmt_fn=_fmt_large, better="higher")
+        _debt_assets = []
+        for t in _cmp_list:
+            f = _cmp_funds.get(t, {})
+            d, a = f.get("total_debt"), f.get("total_assets")
+            _debt_assets.append(d / a if (d is not None and a and a > 0) else None)
+        _cmp_row("Debt / Assets",
+                 _debt_assets, fmt_fn=_pct, better="lower")
+        _cmp_row("Revenue (TTM)",
+                 [_cmp_funds.get(t, {}).get("total_revenue") for t in _cmp_list],
+                 fmt_fn=_fmt_large, better=None)
+        _cmp_row("Free Cash Flow (TTM)",
+                 [_cmp_funds.get(t, {}).get("free_cashflow") for t in _cmp_list],
+                 fmt_fn=_fmt_large, better="higher")
+
+        if _all_equity:
+            st.divider()
+
+            # ── Shares & Dilution ─────────────────────────────────────────────
+            st.markdown("#### Shares & Dilution")
+            _cmp_row("Shares Outstanding",
+                     [_cmp_funds.get(t, {}).get("shares_outstanding") for t in _cmp_list],
+                     fmt_fn=_shares_fmt, better=None)
+
+            _dilution_yoy = []
+            for t in _cmp_list:
+                ann = _cmp_ext[t].get("annual", {})
+                yrs = sorted(ann.keys(), reverse=True)
+                if len(yrs) >= 2:
+                    sh_new = ann[yrs[0]].get("shares") or ann[yrs[0]].get("shares_diluted")
+                    sh_old = ann[yrs[1]].get("shares") or ann[yrs[1]].get("shares_diluted")
+                    _dilution_yoy.append((sh_new - sh_old) / sh_old if (sh_new and sh_old and sh_old > 0) else None)
+                else:
+                    _dilution_yoy.append(None)
+            _cmp_row("Share Count Change (1Y)",
+                     _dilution_yoy, fmt_fn=_pct_signed, better="lower")
+
+            st.divider()
+
+            # ── Quality ───────────────────────────────────────────────────────
+            st.markdown("#### Quality Score")
+            _qs_scores = []
+            for t in _cmp_list:
+                qs, _, _gp = _calc_quality_score(_cmp_funds.get(t, {}))
+                _qs_scores.append(qs)
+            _cmp_row("Quality Score (0–100)",
+                     _qs_scores,
+                     fmt_fn=lambda v: str(v) if v is not None else "—",
+                     better="higher")
+
+            _earn_dates = []
+            for t in _cmp_list:
+                _es = _fmt_earnings_date(_cmp_funds.get(t, {}))
+                if not _es and _cmp_ext[t].get("earnings_date"):
+                    _es = _cmp_ext[t]["earnings_date"].strftime("%b %d, %Y")
+                _earn_dates.append(_es or "—")
+            _cmp_row("Next Earnings",
+                     _earn_dates, fmt_fn=None, better=None, highlight=False)
+
+        if _all_equity:
+            st.divider()
+            st.markdown("#### DCF Fair Value (Base Case)")
+            st.caption("Growth 10% · Discount 10% · Terminal 3% · 10 years · 25% margin of safety")
+            _dcf_ivs, _dcf_mos_ivs = [], []
+            for t in _cmp_list:
+                f = _cmp_funds.get(t, {})
+                fcf_s = f.get("free_cashflow")
+                shs   = f.get("shares_outstanding")
+                if fcf_s and shs and shs > 0:
+                    iv = _dcf_intrinsic(fcf_s / shs, 0.10, 0.10, 0.03, 10)
+                    _dcf_ivs.append(iv)
+                    _dcf_mos_ivs.append(iv * 0.75 if iv else None)
+                else:
+                    _dcf_ivs.append(None)
+                    _dcf_mos_ivs.append(None)
+            _cmp_row("Intrinsic Value (base)",
+                     _dcf_ivs, fmt_fn=lambda v: f"${v:.2f}" if v else "—", better="higher")
+            _cmp_row("After 25% Margin of Safety",
+                     _dcf_mos_ivs, fmt_fn=lambda v: f"${v:.2f}" if v else "—", better="higher")
+
+        st.divider()
+        st.caption("Green highlight = best value in row (for directional metrics). "
+                   "Equity-only metrics (ROIC, Quality Score, Earnings) hidden for ETFs/funds.")
+
+    elif _cmp_list:
+        st.info("Enter at least 2 tickers and click **Compare**.")
+    else:
+        st.info("Enter 2 or 3 ticker symbols above and click **Compare** to see a side-by-side breakdown.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 10 — Watchlist
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_watchlist:
+    st.subheader("Watchlist")
+    st.caption("Track stocks you're researching. Add notes, see live fundamentals, open DCF or Compare from here.")
+
+    _wl = load_watchlist()
+    _owned = set(p["ticker"] for p in summary["open_positions"])
+
+    # ── Add ticker form ───────────────────────────────────────────────────────
+    with st.expander("➕  Add to Watchlist", expanded=len(_wl) == 0):
+        _wa, _wb, _wc = st.columns([2, 4, 1])
+        with _wa:
+            _wl_new_t = st.text_input("Ticker", key="wl_add_t", placeholder="e.g. NVDA").upper().strip()
+        with _wb:
+            _wl_new_note = st.text_input("Note (optional)", key="wl_add_note",
+                                         placeholder="e.g. AI play, watching for pullback to $90")
+        with _wc:
+            st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+            _wl_add_btn = st.button("Add", type="primary", width="stretch", key="wl_add_btn")
+
+        if _wl_add_btn and _wl_new_t:
+            if any(w["ticker"] == _wl_new_t for w in _wl):
+                st.warning(f"{_wl_new_t} is already on your watchlist.")
+            else:
+                _wl.append({"ticker": _wl_new_t, "note": _wl_new_note,
+                             "added": date.today().isoformat()})
+                save_watchlist(_wl)
+                st.rerun()
+
+    if not _wl:
+        st.info("Your watchlist is empty. Add tickers above to start tracking candidates.")
+    else:
+        # Fetch fundamentals for all watchlist tickers
+        _wl_tickers = tuple(w["ticker"] for w in _wl)
+        with st.spinner("Loading fundamentals…"):
+            _wl_funds = load_ticker_fundamentals(_wl_tickers)
+            _wl_names = load_ticker_names(_wl_tickers)
+
+        for _wi, _wentry in enumerate(_wl):
+            _wt   = _wentry["ticker"]
+            _wnote= _wentry.get("note", "")
+            _wadd = _wentry.get("added", "")
+            _wf   = _wl_funds.get(_wt, {})
+            _wname= _wl_names.get(_wt, "")
+            _weq  = _is_equity(_wf)
+
+            _wpe     = _wf.get("pe")
+            _wfpe    = _wf.get("fwd_pe")
+            _wmc     = _wf.get("market_cap")
+            _wtgt    = _wf.get("target_mean")
+            _wrg     = _wf.get("revenue_growth")
+            _wfcf    = _wf.get("free_cashflow")
+            _wshs    = _wf.get("shares_outstanding")
+            _wqs, _, _wgp = _calc_quality_score(_wf) if _weq else (None, [], False)
+            _wroic   = _calc_roic(_wf) if _weq else None
+            _wearing = _fmt_earnings_date(_wf)
+
+            # Live price from yfinance (already in fundamentals cache via info dict)
+            _wcur_price = _wf.get("target_mean")   # fallback only
+            try:
+                import yfinance as _yf_wl
+                _wp_info = _yf_wl.Ticker(_wt).info
+                _wcur_price = _wp_info.get("currentPrice") or _wp_info.get("regularMarketPrice")
+            except Exception:
+                _wcur_price = None
+
+            _wqs_color = _quality_color(_wqs)
+            _owned_badge = (
+                " <span style='background:#1a3a2a;color:#4ade80;border-radius:4px;"
+                "padding:1px 6px;font-size:0.7rem;font-weight:700'>OWNED</span>"
+                if _wt in _owned else ""
+            )
+
+            with st.container():
+                st.markdown(
+                    f"<div style='background:#1e1e2e;border:1px solid #2a2a3e;border-radius:10px;"
+                    f"padding:14px 18px;margin-bottom:10px'>",
+                    unsafe_allow_html=True
+                )
+
+                # Header row
+                _hc1, _hc2 = st.columns([6, 1])
+                with _hc1:
+                    st.markdown(
+                        f"<span style='font-size:1.2rem;font-weight:800;color:#e2e8f0'>{_wt}</span>"
+                        f"{_owned_badge}"
+                        + (f"  <span style='color:#888;font-size:0.85rem'>{_wname}</span>" if _wname and _wname != _wt else "")
+                        + (f"<br><span style='font-size:0.78rem;color:#60a5fa;font-style:italic'>{_wnote}</span>" if _wnote else "")
+                        + (f"<span style='font-size:0.68rem;color:#555;margin-left:8px'>Added {_wadd}</span>" if _wadd else ""),
+                        unsafe_allow_html=True
+                    )
+                with _hc2:
+                    if st.button("Remove ✕", key=f"wl_rm_{_wi}", use_container_width=True):
+                        _wl = [w for w in _wl if w["ticker"] != _wt]
+                        save_watchlist(_wl)
+                        st.rerun()
+
+                # Metrics row
+                _wm_cols = st.columns(6)
+                with _wm_cols[0]:
+                    _wp_str = f"${_wcur_price:,.2f}" if _wcur_price else "—"
+                    st.metric("Price", _wp_str)
+                with _wm_cols[1]:
+                    st.metric("P/E (TTM)", f"{_wpe:.1f}x" if _wpe else "—")
+                with _wm_cols[2]:
+                    st.metric("Fwd P/E", f"{_wfpe:.1f}x" if _wfpe else "—")
+                with _wm_cols[3]:
+                    st.metric("Market Cap", _fmt_large(_wmc))
+                with _wm_cols[4]:
+                    if _weq:
+                        st.metric("Quality", f"{_wqs}/100" if _wqs is not None else "—")
+                    else:
+                        st.metric("Type", _wf.get("quote_type", "—"))
+                with _wm_cols[5]:
+                    if _weq and _wroic is not None:
+                        st.metric("ROIC", f"{_wroic*100:.1f}%")
+                    elif _weq:
+                        _rev_g = f"{_wrg*100:.0f}% rev growth" if _wrg else "—"
+                        st.metric("Rev Growth", _rev_g)
+                    else:
+                        st.metric("Analyst Target", f"${_wtgt:.2f}" if _wtgt else "—")
+
+                # Growth phase note
+                if _wgp:
+                    st.caption("⚡ Growth Phase — revenue growing fast; low FCF score may reflect reinvestment, not weakness.")
+
+                # Earnings + target row
+                _wa2, _wb2, _wc2, _wd2 = st.columns([2, 2, 2, 2])
+                if _weq:
+                    with _wa2:
+                        if _wearing:
+                            st.caption(f"Next earnings: **{_wearing}**")
+                    with _wb2:
+                        if _wtgt and _wcur_price:
+                            _wupside = (_wtgt - _wcur_price) / _wcur_price * 100
+                            _wu_col = "#4ade80" if _wupside > 0 else "#f87171"
+                            st.markdown(
+                                f"<span style='font-size:0.8rem;color:#888'>Analyst target: </span>"
+                                f"<span style='color:{_wu_col};font-weight:700'>${_wtgt:.2f} "
+                                f"({_wupside:+.1f}%)</span>",
+                                unsafe_allow_html=True
+                            )
+
+                # Action buttons
+                _btn1, _btn2, _btn3, _btn_spacer = st.columns([2, 2, 2, 6])
+                with _btn1:
+                    if st.button("🔍 Look Up", key=f"wl_lu_{_wi}", use_container_width=True):
+                        st.session_state["lookup_symbol"] = _wt
+                        st.rerun()
+                with _btn2:
+                    if st.button("⚖️ Compare", key=f"wl_cmp_{_wi}", use_container_width=True):
+                        # Pre-load compare tab with this ticker vs top 2 positions
+                        _owned_list = [p["ticker"] for p in summary["open_positions"]]
+                        _cmp_pre = [_wt] + [t for t in _owned_list if t != _wt][:2]
+                        st.session_state["cmp_tickers"] = _cmp_pre
+                        st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)

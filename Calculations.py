@@ -315,6 +315,16 @@ def _build_split_schedule(ticker_txns: dict) -> dict:
     return schedule
 
 
+@lru_cache(maxsize=256)
+def _get_split_schedule_cached(ticker: str, split_key: tuple) -> list:
+    """
+    Cached wrapper — split_key is a tuple of (date_str, ratio) pairs extracted
+    from split transactions, making it hashable for lru_cache.
+    Returns the sorted schedule list for a single ticker.
+    """
+    return sorted(split_key, key=lambda x: x[0])
+
+
 def _split_price_factor(split_schedule: list, ds: str) -> float:
     """
     Return the cumulative factor to multiply a stored adj_close price by so it
@@ -693,7 +703,8 @@ def get_portfolio_summary(account_dbs: list, prices_db: str = "prices.db",
 
 def get_daily_values(account_dbs: list, prices_db: str = "prices.db",
                      start_date: str = None, end_date: str = None,
-                     account: str = None) -> dict:
+                     account: str = None,
+                     exclude_tickers: set = None) -> dict:
     """
     Daily portfolio value = stock holdings + cash balance.
 
@@ -720,10 +731,12 @@ def get_daily_values(account_dbs: list, prices_db: str = "prices.db",
     start_str, end_str = start.isoformat(), end.isoformat()
 
     # Tickers that had share activity
+    _excl = exclude_tickers or set()
     share_types = BUY_TYPES | SELL_TYPES | TRANSFER_IN_TYPES | {"share_exchange"}
     tickers = sorted(set(
         tx["ticker"] for tx in all_txns
         if tx.get("ticker") and tx["transaction_type"] in share_types
+        and tx["ticker"] not in _excl
     ))
 
     price_series = get_price_series(tickers, start_str, end_str, prices_db)
@@ -752,8 +765,16 @@ def get_daily_values(account_dbs: list, prices_db: str = "prices.db",
         for t in tickers
     }
 
-    # ── Split schedule (for price correction before split dates) ─────
-    split_schedule = _build_split_schedule(ticker_txns)
+    # ── Split schedule (cached per ticker by split events) ───────────
+    split_schedule = {}
+    for _t, _txns in ticker_txns.items():
+        _split_key = tuple(
+            ((_parse_date_safe(tx["activity_date"]) or date.min).isoformat(), float(tx["quantity"]))
+            for tx in _txns
+            if tx["transaction_type"] == "stock_split" and tx.get("quantity") and float(tx["quantity"]) > 0
+        )
+        if _split_key:
+            split_schedule[_t] = _get_split_schedule_cached(_t, _split_key)
 
     # ── Initialise FIFO state to just before chart start ──────────────
     ticker_fifo_state = {}
@@ -864,7 +885,7 @@ def get_daily_values(account_dbs: list, prices_db: str = "prices.db",
         v_prev  = portfolio_values[i - 1]
         v_today = portfolio_values[i]
         cf      = cf_by_date.get(sorted_dates[i], 0.0)
-        if v_prev > 1e-6:
+        if v_prev > 1e-9:
             daily_r   = (v_today - v_prev - cf) / v_prev
             compound *= 1 + daily_r
         twr_series.append(round((compound - 1) * 100, 4))
@@ -983,8 +1004,13 @@ def get_ticker_daily_values(ticker: str, account_dbs: list,
     else:
         idx = len(ticker_txns_sorted)
 
-    # Build split schedule and pre-compute per-date factors
-    ticker_split_schedule  = _build_split_schedule({ticker: ticker_txns_sorted}).get(ticker, [])
+    # Build split schedule and pre-compute per-date factors (cached by ticker + split events)
+    _split_raw = tuple(
+        ((_parse_date_safe(tx["activity_date"]) or date.min).isoformat(), float(tx["quantity"]))
+        for tx in ticker_txns_sorted
+        if tx["transaction_type"] == "stock_split" and tx.get("quantity") and float(tx["quantity"]) > 0
+    )
+    ticker_split_schedule  = _get_split_schedule_cached(ticker, _split_raw)
     ticker_split_fac_list  = _precompute_split_factors(ticker_split_schedule, sorted_dates)
 
     # Pre-sorted price date list for O(log n) forward-fill
@@ -1095,7 +1121,7 @@ def get_ticker_daily_values(ticker: str, account_dbs: list,
         v_prev  = values[i - 1]
         v_today = values[i]
         cf      = cf_by_date.get(sorted_dates[i], 0.0)
-        if v_prev > 1e-6:
+        if v_prev > 1e-9:
             compound *= 1 + (v_today - v_prev - cf) / v_prev
         twr_series.append(round((compound - 1) * 100, 4))
 
